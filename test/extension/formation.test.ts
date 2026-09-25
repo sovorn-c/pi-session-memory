@@ -33,6 +33,7 @@ function testRuntime({ enabled = false, observeAfter = 1, reflectAfter = 1, gate
   const providerCalls = [];
   const disclosures = [];
   let completionNumber = 0;
+  let sessionId = "test-session";
 
   const pi = {
     registerFlag(name, options) {
@@ -58,7 +59,7 @@ function testRuntime({ enabled = false, observeAfter = 1, reflectAfter = 1, gate
     hasUI: true,
     model: { id: "test-model", provider: "test-provider" },
     sessionManager: {
-      getSessionId: () => "test-session",
+      getSessionId: () => sessionId,
       getBranch: () => branch,
     },
     ui: {
@@ -103,6 +104,11 @@ function testRuntime({ enabled = false, observeAfter = 1, reflectAfter = 1, gate
     setBranch(next) { branch = next; },
     async start() {
       await handlers.get("session_start")({ type: "session_start", reason: "new" }, ctx);
+    },
+    async switchSession(nextSessionId) {
+      sessionId = nextSessionId;
+      branch = [];
+      await handlers.get("session_start")({ type: "session_start", reason: "resume" }, ctx);
     },
     async turn({ userId, assistantId, userText, assistantText = "Turn complete", inputTokens, toolResults = [] }) {
       branch = [
@@ -230,6 +236,50 @@ async function waitForFile(path, timeoutMs) {
   }
   throw new Error("Timed out waiting for local fake worker synchronization");
 }
+
+test("worker protocol failure stays unhealthy for the live session and resets for a new session", { timeout: 15_000 }, async (t) => {
+  const workerDir = await mkdtemp(join(tmpdir(), "pi-session-memory-failing-worker-"));
+  const workerScript = join(workerDir, "fake-worker.js");
+  const fakePython = join(workerDir, "fake-python");
+  const launchesFile = join(workerDir, "launches.txt");
+  await writeFile(workerScript, `
+const fs = require("node:fs");
+fs.appendFileSync(process.env.PI_SESSION_MEMORY_TEST_LAUNCHES, "started\\n");
+process.stdin.on("data", () => process.stdout.write("not-json\\n"));
+`);
+  await writeFile(fakePython, '#!/bin/sh\nexec "$PI_SESSION_MEMORY_TEST_NODE" "$PI_SESSION_MEMORY_TEST_WORKER"\n');
+  await chmod(fakePython, 0o755);
+
+  const envKeys = ["PI_SESSION_MEMORY_PYTHON", "PI_SESSION_MEMORY_TEST_NODE", "PI_SESSION_MEMORY_TEST_WORKER", "PI_SESSION_MEMORY_TEST_LAUNCHES"];
+  const previousEnv = new Map(envKeys.map((key) => [key, process.env[key]]));
+  process.env.PI_SESSION_MEMORY_PYTHON = fakePython;
+  process.env.PI_SESSION_MEMORY_TEST_NODE = process.execPath;
+  process.env.PI_SESSION_MEMORY_TEST_WORKER = workerScript;
+  process.env.PI_SESSION_MEMORY_TEST_LAUNCHES = launchesFile;
+
+  const runtime = testRuntime({ enabled: true, useRealWorker: true });
+  t.after(async () => {
+    await runtime.shutdown();
+    for (const [key, value] of previousEnv) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await rm(workerDir, { recursive: true, force: true });
+  });
+
+  await runtime.start();
+  await runtime.turn({ userId: "user-protocol-failure", assistantId: "assistant-protocol-failure", userText: "First synthetic request.", inputTokens: 1 });
+  assert.equal((await readFile(launchesFile, "utf8")).trim().split("\n").length, 1);
+
+  await runtime.turn({ userId: "user-protocol-followup", assistantId: "assistant-protocol-followup", userText: "Later request in the same live session.", inputTokens: 2 });
+  assert.equal((await readFile(launchesFile, "utf8")).trim().split("\n").length, 1, "a failed worker must not automatically restart for a later same-session request");
+
+  await runtime.switchSession("test-session-resumed");
+  await runtime.turn({ userId: "user-protocol-resumed", assistantId: "assistant-protocol-resumed", userText: "Request in a new session.", inputTokens: 1 });
+  assert.equal((await readFile(launchesFile, "utf8")).trim().split("\n").length, 2, "a new session gets one fresh lazy worker attempt");
+  assert.equal(runtime.providerCalls.length, 0);
+  assert.equal(runtime.entries.length, 0);
+});
 
 test("a timed-out worker fails native and its late accepted response cannot generate or append", { timeout: 15_000 }, async (t) => {
   const workerDir = await mkdtemp(join(tmpdir(), "pi-session-memory-silent-worker-"));

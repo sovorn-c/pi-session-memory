@@ -326,10 +326,11 @@ test("real native compaction and same-session resume preserve linked hydration a
   await rpc.waitForEvent(resumePromptCursor, (event) => event.type === "agent_settled");
 
   const contextEvidence = (await readFile(contextEvidenceFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as { projectionPresent?: unknown });
-  assert.ok(contextEvidence.length > 0, "the real resumed context hook must be observed for the memory-needed request");
-  assert.equal(contextEvidence.every((record) => record.projectionPresent === false), true, "forced worker uncertainty must omit semantic projection from every resumed model request");
+  assert.equal(contextEvidence.length, 2, "both resumed context requests must be observed");
+  assert.equal(contextEvidence.filter((record) => record.projectionPresent === true).length, 0, "forced worker uncertainty must return zero semantic projections");
+  assert.equal(contextEvidence.every((record) => record.projectionPresent === false), true, "native context must remain unchanged for every resumed model request");
   const workerInvocations = (await readFile(workerMarker, "utf8")).trim().split("\n").filter(Boolean);
-  assert.ok(workerInvocations.length > 0, "the test worker shim must run and return malformed protocol data to force uncertainty");
+  assert.equal(workerInvocations.length, 1, "a malformed worker response must leave the live session unhealthy without automatic restart");
 
   const hydrationEvents = rpc.recordsSince(resumePromptCursor).filter((event) => event.type === "tool_execution_end" && event.toolName === "hydrate_session_memory");
   assert.equal(hydrationEvents.length, 2, "the configured provider must call the model-callable hydration tool for both synthetic cases");

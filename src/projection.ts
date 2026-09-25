@@ -167,7 +167,7 @@ function activeCandidates(branch: SessionEntry[]): Candidate[] {
   for (const [id, value] of observations) {
     const sources = value.data.sourceEntryIds.flatMap((sourceId) => {
       const source = rawEntries.get(sourceId);
-      return source ? [messageText(source.message.content)] : [];
+      return source ? [messageText(source.message)] : [];
     });
     candidates.push({
       entryId: id,
@@ -188,7 +188,7 @@ function activeCandidates(branch: SessionEntry[]): Candidate[] {
     const sourceEntryIds = [...new Set(linkedObservations.flatMap(({ data }) => data.sourceEntryIds))];
     const sourceText = sourceEntryIds.flatMap((sourceId) => {
       const source = rawEntries.get(sourceId);
-      return source ? [messageText(source.message.content)] : [];
+      return source ? [messageText(source.message)] : [];
     }).join(" ");
     candidates.push({
       entryId: id,
@@ -220,15 +220,15 @@ function candidateScore(candidate: Candidate, currentTerms: Set<string>, context
 }
 
 function activeContextText(messages: ContextMessages, latestUserText: string): string {
-  const recent = messages.slice(-7).filter((message) => message.role !== "user" || messageText(message.content) !== latestUserText);
-  return recent.map((message) => messageText(message.content)).join(" ");
+  const recent = messages.slice(-7).filter((message) => message.role !== "user" || messageText(message) !== latestUserText);
+  return recent.map((message) => messageText(message)).join(" ");
 }
 
 function lastUserText(messages: ContextMessages): string | undefined {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
     if (message.role === "user") {
-      const text = messageText(message.content).trim();
+      const text = messageText(message).trim();
       return text.length > 0 ? text : undefined;
     }
   }
@@ -290,7 +290,8 @@ function truncate(value: string, maximum: number): string {
   return value.slice(0, maximum);
 }
 
-function messageText(content: unknown): string {
+function messageText(message: unknown): string {
+  const content = isRecord(message) && "content" in message ? message.content : message;
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
   return content.flatMap((part): string[] => isRecord(part) && part.type === "text" && typeof part.text === "string" ? [part.text] : []).join("\n");

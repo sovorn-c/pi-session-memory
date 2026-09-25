@@ -77,6 +77,7 @@ class LayaWorker {
   private lines: ReadlineInterface | undefined;
   private pending: { requestId: string; gate: FormationGate; resolve: (decision: GateResult) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> } | undefined;
   private queue: Promise<void> = Promise.resolve();
+  private unhealthy = false;
   private readonly timeoutScheduler: WorkerTimeoutScheduler;
 
   constructor(timeoutScheduler: WorkerTimeoutScheduler) {
@@ -84,15 +85,26 @@ class LayaWorker {
   }
 
   request(request: GateRequest): Promise<GateResult> {
-    const queued = this.queue.then(() => new Promise<GateResult>((resolveResult, rejectResult) => {
-      const child = this.start();
-      const requestId = randomUUID();
-      const timer = this.timeoutScheduler.setTimeout(() => this.fail(new Error("Laya worker request timed out"), child), WORKER_REQUEST_TIMEOUT_MS);
-      this.pending = { requestId, gate: request.gate, resolve: resolveResult, reject: rejectResult, timer };
-      child.stdin.write(`${JSON.stringify({ protocol_version: PROTOCOL_VERSION, request_id: requestId, gate: request.gate, state: request.state })}\n`, (error) => {
-        if (error) this.fail(error, child);
+    const queued = this.queue.then(() => {
+      if (this.unhealthy) return Promise.reject(new Error("Laya worker is unhealthy for this session"));
+      return new Promise<GateResult>((resolveResult, rejectResult) => {
+        let child: ChildProcessWithoutNullStreams;
+        try {
+          child = this.start();
+        } catch (error) {
+          const failure = error instanceof Error ? error : new Error("Could not start Laya worker");
+          this.fail(failure);
+          rejectResult(failure);
+          return;
+        }
+        const requestId = randomUUID();
+        const timer = this.timeoutScheduler.setTimeout(() => this.fail(new Error("Laya worker request timed out"), child), WORKER_REQUEST_TIMEOUT_MS);
+        this.pending = { requestId, gate: request.gate, resolve: resolveResult, reject: rejectResult, timer };
+        child.stdin.write(`${JSON.stringify({ protocol_version: PROTOCOL_VERSION, request_id: requestId, gate: request.gate, state: request.state })}\n`, (error) => {
+          if (error) this.fail(error, child);
+        });
       });
-    }));
+    });
     this.queue = queued.then(() => undefined, () => undefined);
     return queued;
   }
@@ -113,13 +125,7 @@ class LayaWorker {
     child.on("error", (error) => this.fail(error, child));
     child.on("exit", (code, signal) => {
       if (this.child !== child) return;
-      if (this.pending) {
-        this.fail(new Error(`Laya worker exited (${code ?? signal ?? "unknown"})`), child);
-        return;
-      }
-      this.child = undefined;
-      this.lines?.close();
-      this.lines = undefined;
+      this.fail(new Error(`Laya worker exited (${code ?? signal ?? "unknown"})`), child);
     });
     return child;
   }
@@ -139,9 +145,13 @@ class LayaWorker {
     }
     if (pending.gate === "projection") {
       const selected_entry_id = payload.decision.selected_entry_id;
-      if (selected_entry_id !== null && typeof selected_entry_id !== "string") {
-        return this.fail(new Error("Invalid Laya worker selection"), child);
+      if (selected_entry_id === null) {
+        this.timeoutScheduler.clearTimeout(pending.timer);
+        this.pending = undefined;
+        pending.resolve({ selected_entry_id: null });
+        return;
       }
+      if (typeof selected_entry_id !== "string") return this.fail(new Error("Invalid Laya worker selection"), child);
       this.timeoutScheduler.clearTimeout(pending.timer);
       this.pending = undefined;
       pending.resolve({ selected_entry_id });
@@ -158,6 +168,7 @@ class LayaWorker {
 
   private fail(error: Error, sourceChild?: ChildProcessWithoutNullStreams): void {
     if (sourceChild && this.child !== sourceChild) return;
+    this.unhealthy = true;
     const pending = this.pending;
     this.pending = undefined;
     if (pending) this.timeoutScheduler.clearTimeout(pending.timer);
@@ -240,7 +251,7 @@ async function formForTurn(
   sessionId: string,
   cadenceBySession: Map<string, FormationCadence>,
   consentedSessions: Set<string>,
-  gate: (sessionId: string, request: GateRequest) => Promise<GateDecision>,
+  gate: (sessionId: string, request: GateRequest) => Promise<GateResult>,
 ): Promise<void> {
   const branch = ctx.sessionManager.getBranch();
   const cadence = cadenceBySession.get(sessionId) ?? {
@@ -343,7 +354,7 @@ async function enabledModel(
 
 async function generateText(ctx: ExtensionContext, model: NonNullable<ExtensionContext["model"]>, prompt: string): Promise<string | undefined> {
   try {
-    const response = await ctx.modelRegistry.complete(model, { messages: [{ role: "user", content: prompt }] });
+    const response = await ctx.modelRegistry.complete(model, { messages: [{ role: "user", content: prompt, timestamp: Date.now() }] });
     const text = response.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("\n").trim();
     return text.length > 0 && text.length <= MAX_MEMORY_TEXT_CHARS ? text : undefined;
   } catch {
@@ -377,7 +388,7 @@ function rawSourcesForTurn(event: TurnEndEvent, branch: SessionEntry[]): RawSour
   return entries.map((entry) => ({
     entryId: entry.id,
     role: entry.message.role,
-    text: truncateUtf8(messageText(entry.message.content), perSourceBytes),
+    text: truncateUtf8(messageText(entry.message), perSourceBytes),
   }));
 }
 
@@ -422,7 +433,8 @@ function encodeGateState(value: unknown): string | undefined {
   return Buffer.byteLength(encoded, "utf8") <= MAX_GATE_STATE_BYTES && Buffer.byteLength(request, "utf8") < 16_384 ? encoded : undefined;
 }
 
-function messageText(content: unknown): string {
+function messageText(message: unknown): string {
+  const content = isRecord(message) && "content" in message ? message.content : message;
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
   return content.flatMap((part): string[] => {
