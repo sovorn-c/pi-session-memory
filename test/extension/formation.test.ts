@@ -170,6 +170,27 @@ test("a rejected Laya gate does not disclose or call the provider", async () => 
   assert.equal(runtime.disclosures.length, 0);
 });
 
+test("a rejected reflection gate does not disclose, call the provider, or append a reflection", async () => {
+  const rawOne = rawMessage("raw-reflection-one", "user", "First linked synthetic evidence.");
+  const rawTwo = rawMessage("raw-reflection-two", "user", "Second linked synthetic evidence.");
+  const observationOne = { type: "custom", id: "observation-reflection-one", customType: observationType, data: { schemaVersion: 1, text: "First established fact.", sourceEntryIds: [rawOne.id] } };
+  const observationTwo = { type: "custom", id: "observation-reflection-two", customType: observationType, data: { schemaVersion: 1, text: "Second established fact.", sourceEntryIds: [rawTwo.id] } };
+  const runtime = testRuntime({
+    enabled: true,
+    observeAfter: 100,
+    reflectAfter: 1,
+    gateResults: [{ accepted: false, p_true: 0.1, confidence: 0.9 }],
+  });
+  runtime.setBranch([rawOne, observationOne, rawTwo, observationTwo]);
+  await runtime.start();
+  await runtime.turn({ userId: "user-reflection-rejected", assistantId: "assistant-reflection-rejected", userText: "Synthesize the linked facts.", inputTokens: 1 });
+
+  assert.deepEqual(runtime.gateRequests.map(({ gate }) => gate), ["reflection"]);
+  assert.equal(runtime.providerCalls.length, 0);
+  assert.equal(runtime.disclosures.length, 0);
+  assert.equal(runtime.entries.filter(({ customType }) => customType === reflectionType).length, 0);
+});
+
 test("generation stays off by default after an accepted gate", async () => {
   const runtime = testRuntime({ enabled: false });
   await runtime.start();

@@ -1,4 +1,5 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, type ChildProcessByStdio } from "node:child_process";
+import type { Readable, Writable } from "node:stream";
 import { randomUUID } from "node:crypto";
 import { createInterface, type Interface as ReadlineInterface } from "node:readline";
 import { dirname, resolve } from "node:path";
@@ -21,6 +22,7 @@ const REFLECT_FLAG = "e01-reflect-after-tokens";
 const ENABLE_FLAG = "e01-memory-generation";
 const DISCLOSURE =
   "Session-derived text and its source entry IDs will be sent to the currently configured Pi model/provider only after a local Laya gate accepts. Laya runs locally. The Pi session remains canonical; generated memories are appended as non-context session entries. Do you allow this for the current session?";
+type LayaWorkerProcess = ChildProcessByStdio<Writable, Readable, null>;
 
 export type FormationGate = "observation" | "reflection" | "resident" | "projection";
 export interface GateRequest {
@@ -73,7 +75,7 @@ interface LinkedObservation {
 }
 
 class LayaWorker {
-  private child: ChildProcessWithoutNullStreams | undefined;
+  private child: LayaWorkerProcess | undefined;
   private lines: ReadlineInterface | undefined;
   private pending: { requestId: string; gate: FormationGate; resolve: (decision: GateResult) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> } | undefined;
   private queue: Promise<void> = Promise.resolve();
@@ -88,7 +90,7 @@ class LayaWorker {
     const queued = this.queue.then(() => {
       if (this.unhealthy) return Promise.reject(new Error("Laya worker is unhealthy for this session"));
       return new Promise<GateResult>((resolveResult, rejectResult) => {
-        let child: ChildProcessWithoutNullStreams;
+        let child: LayaWorkerProcess;
         try {
           child = this.start();
         } catch (error) {
@@ -113,7 +115,7 @@ class LayaWorker {
     this.fail(new Error("Laya worker stopped"));
   }
 
-  private start(): ChildProcessWithoutNullStreams {
+  private start(): LayaWorkerProcess {
     if (this.child) return this.child;
     const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
     const python = process.env.PI_SESSION_MEMORY_PYTHON ?? "python3";
@@ -130,7 +132,7 @@ class LayaWorker {
     return child;
   }
 
-  private receive(line: string, child: ChildProcessWithoutNullStreams): void {
+  private receive(line: string, child: LayaWorkerProcess): void {
     if (this.child !== child) return;
     const pending = this.pending;
     if (!pending) return this.fail(new Error("Unexpected Laya worker response"), child);
@@ -166,7 +168,7 @@ class LayaWorker {
     pending.resolve({ accepted, p_true, confidence });
   }
 
-  private fail(error: Error, sourceChild?: ChildProcessWithoutNullStreams): void {
+  private fail(error: Error, sourceChild?: LayaWorkerProcess): void {
     if (sourceChild && this.child !== sourceChild) return;
     this.unhealthy = true;
     const pending = this.pending;
