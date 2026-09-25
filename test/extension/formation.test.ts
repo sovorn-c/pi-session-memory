@@ -32,6 +32,7 @@ function testRuntime({ enabled = false, observeAfter = 1, reflectAfter = 1, gate
   const gateRequests = [];
   const providerCalls = [];
   const disclosures = [];
+  const notifications = [];
   let completionNumber = 0;
   let sessionId = "test-session";
 
@@ -67,6 +68,7 @@ function testRuntime({ enabled = false, observeAfter = 1, reflectAfter = 1, gate
         disclosures.push({ title, message });
         return approve;
       },
+      notify: (message, type) => notifications.push({ message, type }),
     },
     modelRegistry: {
       complete: async (model, context) => {
@@ -98,6 +100,7 @@ function testRuntime({ enabled = false, observeAfter = 1, reflectAfter = 1, gate
     gateRequests,
     providerCalls,
     disclosures,
+    notifications,
     handlers,
     ctx,
     flags,
@@ -291,15 +294,72 @@ process.stdin.on("data", () => process.stdout.write("not-json\\n"));
   await runtime.start();
   await runtime.turn({ userId: "user-protocol-failure", assistantId: "assistant-protocol-failure", userText: "First synthetic request.", inputTokens: 1 });
   assert.equal((await readFile(launchesFile, "utf8")).trim().split("\n").length, 1);
+  assert.deepEqual(runtime.notifications, [{ message: "Session memory worker unavailable; continuing with native Pi context.", type: "warning" }]);
 
   await runtime.turn({ userId: "user-protocol-followup", assistantId: "assistant-protocol-followup", userText: "Later request in the same live session.", inputTokens: 2 });
   assert.equal((await readFile(launchesFile, "utf8")).trim().split("\n").length, 1, "a failed worker must not automatically restart for a later same-session request");
+  assert.equal(runtime.notifications.length, 1, "later rejected same-session requests must not repeat the failure notification");
 
   await runtime.switchSession("test-session-resumed");
+  assert.equal(runtime.notifications.length, 1, "deliberately stopping the old worker on session switch must not alert");
   await runtime.turn({ userId: "user-protocol-resumed", assistantId: "assistant-protocol-resumed", userText: "Request in a new session.", inputTokens: 1 });
   assert.equal((await readFile(launchesFile, "utf8")).trim().split("\n").length, 2, "a new session gets one fresh lazy worker attempt");
+  assert.deepEqual(runtime.notifications, [
+    { message: "Session memory worker unavailable; continuing with native Pi context.", type: "warning" },
+    { message: "Session memory worker unavailable; continuing with native Pi context.", type: "warning" },
+  ], "each failed worker reports once, and the new session gets its own report");
   assert.equal(runtime.providerCalls.length, 0);
   assert.equal(runtime.entries.length, 0);
+});
+
+test("a successful worker request does not emit a failure notification", { timeout: 15_000 }, async (t) => {
+  const workerDir = await mkdtemp(join(tmpdir(), "pi-session-memory-healthy-worker-"));
+  const workerScript = join(workerDir, "fake-worker.js");
+  const fakePython = join(workerDir, "fake-python");
+  const requestsFile = join(workerDir, "requests.txt");
+  await writeFile(workerScript, `
+const fs = require("node:fs");
+let input = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  input += chunk;
+  let newline = input.indexOf("\\n");
+  while (newline >= 0) {
+    const request = JSON.parse(input.slice(0, newline));
+    input = input.slice(newline + 1);
+    fs.appendFileSync(process.env.PI_SESSION_MEMORY_TEST_REQUESTS, request.gate + "\\n");
+    process.stdout.write(JSON.stringify({ protocol_version: 1, request_id: request.request_id, gate: request.gate, status: "ok", decision: { accepted: true, p_true: 0.95, confidence: 0.9 } }) + "\\n");
+    newline = input.indexOf("\\n");
+  }
+});
+`);
+  await writeFile(fakePython, '#!/bin/sh\nexec "$PI_SESSION_MEMORY_TEST_NODE" "$PI_SESSION_MEMORY_TEST_WORKER"\n');
+  await chmod(fakePython, 0o755);
+
+  const envKeys = ["PI_SESSION_MEMORY_PYTHON", "PI_SESSION_MEMORY_TEST_NODE", "PI_SESSION_MEMORY_TEST_WORKER", "PI_SESSION_MEMORY_TEST_REQUESTS"];
+  const previousEnv = new Map(envKeys.map((key) => [key, process.env[key]]));
+  process.env.PI_SESSION_MEMORY_PYTHON = fakePython;
+  process.env.PI_SESSION_MEMORY_TEST_NODE = process.execPath;
+  process.env.PI_SESSION_MEMORY_TEST_WORKER = workerScript;
+  process.env.PI_SESSION_MEMORY_TEST_REQUESTS = requestsFile;
+
+  const runtime = testRuntime({ enabled: false, useRealWorker: true });
+  t.after(async () => {
+    await runtime.shutdown();
+    for (const [key, value] of previousEnv) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await rm(workerDir, { recursive: true, force: true });
+  });
+
+  await runtime.start();
+  await runtime.turn({ userId: "user-worker-success", assistantId: "assistant-worker-success", userText: "Synthetic successful worker check.", inputTokens: 1 });
+  assert.equal((await readFile(requestsFile, "utf8")).trim(), "observation", "the fake worker must accept the real extension's JSONL request");
+  assert.deepEqual(runtime.notifications, []);
+  assert.equal(runtime.providerCalls.length, 0);
+  await runtime.shutdown();
+  assert.deepEqual(runtime.notifications, [], "deliberate worker shutdown must not report a failure");
 });
 
 test("a timed-out worker fails native and its late accepted response cannot generate or append", { timeout: 15_000 }, async (t) => {
@@ -373,6 +433,7 @@ process.stdin.on("data", (chunk) => {
   assert.equal(runtime.providerCalls.length, 0);
   assert.equal(runtime.disclosures.length, 0);
   assert.equal(runtime.entries.length, 0);
+  assert.deepEqual(runtime.notifications, [{ message: "Session memory worker unavailable; continuing with native Pi context.", type: "warning" }]);
   const pid = Number(await readFile(pidFile, "utf8"));
   assert.throws(() => process.kill(pid, 0), { code: "ESRCH" }, "timed-out child process must be terminated");
 });

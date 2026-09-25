@@ -22,6 +22,7 @@ const REFLECT_FLAG = "e01-reflect-after-tokens";
 const ENABLE_FLAG = "e01-memory-generation";
 const DISCLOSURE =
   "Session-derived text and its source entry IDs will be sent to the currently configured Pi model/provider only after a local Laya gate accepts. Laya runs locally. The Pi session remains canonical; generated memories are appended as non-context session entries. Do you allow this for the current session?";
+const WORKER_FAILURE_NOTICE = "Session memory worker unavailable; continuing with native Pi context.";
 type LayaWorkerProcess = ChildProcessByStdio<Writable, Readable, null>;
 
 export type FormationGate = "observation" | "reflection" | "resident" | "projection";
@@ -81,9 +82,11 @@ class LayaWorker {
   private queue: Promise<void> = Promise.resolve();
   private unhealthy = false;
   private readonly timeoutScheduler: WorkerTimeoutScheduler;
+  private readonly reportFailure: () => void;
 
-  constructor(timeoutScheduler: WorkerTimeoutScheduler) {
+  constructor(timeoutScheduler: WorkerTimeoutScheduler, reportFailure: () => void) {
     this.timeoutScheduler = timeoutScheduler;
+    this.reportFailure = reportFailure;
   }
 
   request(request: GateRequest): Promise<GateResult> {
@@ -112,7 +115,7 @@ class LayaWorker {
   }
 
   stop(): void {
-    this.fail(new Error("Laya worker stopped"));
+    this.fail(new Error("Laya worker stopped"), undefined, false);
   }
 
   private start(): LayaWorkerProcess {
@@ -168,8 +171,9 @@ class LayaWorker {
     pending.resolve({ accepted, p_true, confidence });
   }
 
-  private fail(error: Error, sourceChild?: LayaWorkerProcess): void {
+  private fail(error: Error, sourceChild?: LayaWorkerProcess, report = true): void {
     if (sourceChild && this.child !== sourceChild) return;
+    const shouldReport = report && !this.unhealthy;
     this.unhealthy = true;
     const pending = this.pending;
     this.pending = undefined;
@@ -179,6 +183,7 @@ class LayaWorker {
     this.child = undefined;
     this.lines?.close();
     this.lines = undefined;
+    if (shouldReport) this.reportFailure();
   }
 }
 
@@ -198,18 +203,18 @@ export function registerFormation(pi: ExtensionAPI, options: FormationOptions = 
   let worker: LayaWorker | undefined;
   let workerSessionId: string | undefined;
 
-  const gate = (sessionId: string, request: GateRequest): Promise<GateResult> => {
+  const gate = (sessionId: string, request: GateRequest, ctx: ExtensionContext): Promise<GateResult> => {
     if (evaluateGate) return evaluateGate(request);
     if (workerSessionId !== sessionId) {
       worker?.stop();
       worker = undefined;
       workerSessionId = sessionId;
     }
-    worker ??= new LayaWorker(timeoutScheduler);
+    worker ??= new LayaWorker(timeoutScheduler, () => reportWorkerFailure(ctx));
     return worker.request(request);
   };
 
-  const clearProjection = registerProjection(pi, (sessionId, request: ProjectionGateRequest) => gate(sessionId, request));
+  const clearProjection = registerProjection(pi, (sessionId, request: ProjectionGateRequest, ctx) => gate(sessionId, request, ctx));
 
   pi.on("session_start", (event: SessionStartEvent, ctx: ExtensionContext) => {
     const sessionId = ctx.sessionManager.getSessionId();
@@ -253,7 +258,7 @@ async function formForTurn(
   sessionId: string,
   cadenceBySession: Map<string, FormationCadence>,
   consentedSessions: Set<string>,
-  gate: (sessionId: string, request: GateRequest) => Promise<GateResult>,
+  gate: (sessionId: string, request: GateRequest, ctx: ExtensionContext) => Promise<GateResult>,
 ): Promise<void> {
   const branch = ctx.sessionManager.getBranch();
   const cadence = cadenceBySession.get(sessionId) ?? {
@@ -282,7 +287,7 @@ async function formForTurn(
     if (sources.length > 0) {
       const state = encodeGateState({ sourceEntryIds: sources.map(({ entryId }) => entryId), sources });
       if (state) {
-        const decision = await gate(sessionId, { gate: "observation", state });
+        const decision = await gate(sessionId, { gate: "observation", state }, ctx);
         if (isGateDecision(decision) && decision.accepted) await generateObservation(pi, ctx, sessionId, sources, consentedSessions);
       }
     }
@@ -293,7 +298,7 @@ async function formForTurn(
     if (observations.length >= 2) {
       const state = encodeGateState({ observations: observations.map(({ entryId, data }) => ({ entryId, text: data.text, sourceEntryIds: data.sourceEntryIds })) });
       if (state) {
-        const decision = await gate(sessionId, { gate: "reflection", state });
+        const decision = await gate(sessionId, { gate: "reflection", state }, ctx);
         if (isGateDecision(decision) && decision.accepted) await generateReflection(pi, ctx, sessionId, observations, consentedSessions);
       }
     }
@@ -362,6 +367,16 @@ async function generateText(ctx: ExtensionContext, model: NonNullable<ExtensionC
   } catch {
     return undefined;
   }
+}
+
+function reportWorkerFailure(ctx: ExtensionContext): void {
+  if (ctx.hasUI) {
+    try {
+      ctx.ui.notify(WORKER_FAILURE_NOTICE, "warning");
+      return;
+    } catch {}
+  }
+  process.stderr.write(`${WORKER_FAILURE_NOTICE}\n`);
 }
 
 function rawSourcesForTurn(event: TurnEndEvent, branch: SessionEntry[]): RawSource[] {

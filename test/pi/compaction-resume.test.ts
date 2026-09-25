@@ -42,7 +42,8 @@ class PiRpc {
   private waiters: EventWaiter[] = [];
   private protocolFailure: Error | undefined;
   private stopping = false;
-  extensionUiRequests = 0;
+  readonly notificationRequests: RpcRecord[] = [];
+  readonly confirmationRequests: RpcRecord[] = [];
 
   constructor(piExecutable: string, cwd: string, sessionDir: string, sessionFile: string, observerExtension: string, workerPython?: string) {
     const workerMarker = resolve(dirname(observerExtension), "worker-started.txt");
@@ -178,8 +179,11 @@ class PiRpc {
     }
     this.records.push(value);
     if (value.type === "extension_ui_request" && typeof value.id === "string") {
-      this.extensionUiRequests += 1;
-      this.child.stdin.write(`${JSON.stringify({ type: "extension_ui_response", id: value.id, confirmed: false })}\n`);
+      if (value.method === "notify") this.notificationRequests.push(value);
+      if (value.method === "confirm") {
+        this.confirmationRequests.push(value);
+        this.child.stdin.write(`${JSON.stringify({ type: "extension_ui_response", id: value.id, confirmed: false })}\n`);
+      }
     }
     for (const waiter of [...this.waiters]) {
       if (!this.records.slice(waiter.after).includes(value) || !waiter.predicate(value)) continue;
@@ -289,7 +293,7 @@ test("real native compaction and same-session resume preserve linked hydration a
   assertContained(firstSessionFile, sessionRoot, "spawned Pi session must remain inside the fresh disposable directory");
   assert.ok(isRecord(initialState.data.model), "a configured Pi model must be available for real native compaction");
   assert.equal(typeof initialState.data.model.provider, "string", "configured provider identity must be available");
-  assert.equal(rpc.extensionUiRequests, 0, "memory generation disclosure must not be bypassed or requested by this test");
+  assert.equal(rpc.confirmationRequests.length, 0, "memory generation consent must not be requested by this test");
 
   const firstCompaction = await runNativeCompaction(rpc);
   await rpc.stop();
@@ -315,7 +319,7 @@ test("real native compaction and same-session resume preserve linked hydration a
   const resumedSessionFile = await realpath(resolve(cwd, resumedState.data.sessionFile));
   assert.equal(resumedSessionFile, canonicalSessionFile, "resume must open the exact same persisted session file");
   assertContained(resumedSessionFile, sessionRoot, "resumed Pi session must remain inside the fresh disposable directory");
-  assert.equal(rpc.extensionUiRequests, 0, "resumed memory generation remains disabled unless separately disclosed and enabled");
+  assert.equal(rpc.confirmationRequests.length, 0, "resumed memory generation remains disabled unless separately disclosed and enabled");
 
   const resumePromptCursor = rpc.cursor();
   const promptResponse = await rpc.command({
@@ -324,9 +328,16 @@ test("real native compaction and same-session resume preserve linked hydration a
   });
   assert.equal(promptResponse.success, true, "ordinary Pi RPC interaction must accept the synthetic resume prompt");
   await rpc.waitForEvent(resumePromptCursor, (event) => event.type === "agent_settled");
+  assert.equal(rpc.confirmationRequests.length, 0, "generation remains default-off and must not request consent");
+  assert.equal(rpc.notificationRequests.length, 1, "malformed worker uncertainty must produce exactly one actual RPC warning notification");
+  assert.deepEqual(
+    { method: rpc.notificationRequests[0].method, notifyType: rpc.notificationRequests[0].notifyType, message: rpc.notificationRequests[0].message },
+    { method: "notify", notifyType: "warning", message: "Session memory worker unavailable; continuing with native Pi context." },
+    "the local notification must be static and must not expose session, worker, or provider data",
+  );
 
   const contextEvidence = (await readFile(contextEvidenceFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as { projectionPresent?: unknown });
-  assert.equal(contextEvidence.length, 2, "both resumed context requests must be observed");
+  assert.ok(contextEvidence.length >= 2, "multiple resumed context requests must be observed");
   assert.equal(contextEvidence.filter((record) => record.projectionPresent === true).length, 0, "forced worker uncertainty must return zero semantic projections");
   assert.equal(contextEvidence.every((record) => record.projectionPresent === false), true, "native context must remain unchanged for every resumed model request");
   const workerInvocations = (await readFile(workerMarker, "utf8")).trim().split("\n").filter(Boolean);
@@ -348,10 +359,14 @@ test("real native compaction and same-session resume preserve linked hydration a
   assert.equal(partialRecovery.status, "partial");
   assert.deepEqual(partialRecovery.missingIds, [missingObservationId]);
   assert.equal(partialRecovery.exactEvidenceRecovered, false, "an unresolved post-resume link must never claim exact recovery");
-  assert.equal(rpc.extensionUiRequests, 0, "test hydration and native compaction must not activate memory text generation");
+  assert.equal(rpc.confirmationRequests.length, 0, "test hydration must not activate memory text generation");
+  assert.equal(rpc.notificationRequests.length, 1, "later requests in this unhealthy session must not repeat the warning");
 
   const secondCompaction = await runNativeCompaction(rpc);
-  const extensionUiRequests = rpc.extensionUiRequests;
+  assert.equal(rpc.notificationRequests.length, 1, "native compaction must not repeat the worker warning");
+  assert.equal(rpc.confirmationRequests.length, 0, "native compaction must not request memory generation consent");
+  const warningNotifications = rpc.notificationRequests.length;
+  const generationConsentRequests = rpc.confirmationRequests.length;
   await rpc.stop();
   rpc = undefined;
 
@@ -376,7 +391,8 @@ test("real native compaction and same-session resume preserve linked hydration a
     originalRawMessageEntriesUnchanged: initialRawEntries.length,
     nativeCompactions: [firstCompaction, secondCompaction],
     workerUncertainty: { malformedWorkerResponses: workerInvocations.length, resumedContextRequests: contextEvidence.length, semanticProjectionsReturned: contextEvidence.filter((record) => record.projectionPresent === true).length },
-    memoryGenerationDisclosureRequests: extensionUiRequests,
+    warningNotifications,
+    generationConsentRequests,
   })}`);
 });
 

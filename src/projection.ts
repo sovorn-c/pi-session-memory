@@ -1,4 +1,4 @@
-import type { ContextEvent, ExtensionAPI, SessionEntry } from "@earendil-works/pi-coding-agent";
+import type { ContextEvent, ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 
 const OBSERVATION_TYPE = "pi-session-memory.observation";
 const REFLECTION_TYPE = "pi-session-memory.reflection";
@@ -32,7 +32,7 @@ export interface ProjectionSelectionDecision {
   selected_entry_id: string | null;
 }
 export type ProjectionDecision = ProjectionSufficiencyDecision | ProjectionSelectionDecision;
-type EvaluateProjection = (sessionId: string, request: ProjectionGateRequest) => Promise<ProjectionDecision>;
+type EvaluateProjection = (sessionId: string, request: ProjectionGateRequest, ctx: ExtensionContext) => Promise<ProjectionDecision>;
 type ContextMessages = ContextEvent["messages"];
 
 interface ObservationData {
@@ -94,7 +94,7 @@ export function registerProjection(pi: ExtensionAPI, evaluate: EvaluateProjectio
         if (resident) {
           const state = encodeState({ need: truncate(latestUserText, MAX_NEED_CHARS), candidate: { entryId: resident.entryId, kind: resident.kind, text: resident.text } });
           if (!state) return { messages: originalMessages };
-          const decision = await evaluate(sessionId, { gate: "resident", state });
+          const decision = await evaluate(sessionId, { gate: "resident", state }, ctx);
           if (!isSufficiencyDecision(decision)) return { messages: originalMessages };
           if (decision.accepted) {
             const currentBranch = ctx.sessionManager.getBranch();
@@ -125,7 +125,7 @@ export function registerProjection(pi: ExtensionAPI, evaluate: EvaluateProjectio
         candidates: ranked.map(({ entryId, kind, text }) => ({ entryId, kind, text: truncate(text, MAX_CANDIDATE_TEXT_CHARS) })),
       });
       if (!state) return { messages: originalMessages };
-      const selection = await evaluate(sessionId, { gate: "projection", state });
+      const selection = await evaluate(sessionId, { gate: "projection", state }, ctx);
       if (!isSelectionDecision(selection) || selection.selected_entry_id === null) return { messages: originalMessages };
       const selected = ranked.find(({ entryId }) => entryId === selection.selected_entry_id);
       if (!selected) return { messages: originalMessages };
