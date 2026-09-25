@@ -4,6 +4,7 @@ import { createInterface, type Interface as ReadlineInterface } from "node:readl
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext, SessionEntry, SessionStartEvent, TurnEndEvent } from "@earendil-works/pi-coding-agent";
+import { registerHydration } from "./hydration.ts";
 
 const OBSERVATION_TYPE = "pi-session-memory.observation";
 const REFLECTION_TYPE = "pi-session-memory.reflection";
@@ -454,4 +455,5 @@ function isObservationData(value: unknown): value is ObservationData {
 
 export default function (pi: ExtensionAPI): void {
   registerFormation(pi);
+  registerHydration(pi);
 }
