@@ -1,0 +1,17 @@
+# Local agent cockpit
+specs/
+CLAUDE.md
+AGENTS.md
+CONVENTIONS.md
+.cursor/
+.cursorrules
+.cursorignore
+.codex/
+.pi/
+graphify-out/
+
+# Local machine and configuration
+.DS_Store
+.env
+.env.*
+!.env.example
