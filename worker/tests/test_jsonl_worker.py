@@ -11,6 +11,41 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 class JsonlWorkerIntegrationTests(unittest.TestCase):
+    def test_unsupported_python_version_exits_before_importing_worker_adapters(self):
+        env = os.environ.copy()
+        env["PI_SESSION_MEMORY_PYTHON"] = "configured-python3.9"
+        script = """
+import builtins
+import runpy
+import sys
+
+sys.version_info = (3, 9, 6, "final", 0)
+original_import = builtins.__import__
+def guarded_import(name, *args, **kwargs):
+    if name in {"worker.protocol", "worker.laya_runtime"}:
+        raise RuntimeError("worker adapter imported before interpreter guard")
+    return original_import(name, *args, **kwargs)
+builtins.__import__ = guarded_import
+try:
+    runpy.run_module("worker", run_name="__main__")
+except SystemExit as error:
+    sys.exit(error.code)
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=PROJECT_ROOT,
+            env=env,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(
+            result.stderr.decode(errors="replace"),
+            "Laya worker requires Python 3.11; set PI_SESSION_MEMORY_PYTHON to a Python 3.11 interpreter.\n",
+        )
+
     def test_one_process_serves_bounded_formation_and_projection_requests(self):
         env = os.environ.copy()
         env.update(

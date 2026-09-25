@@ -312,11 +312,12 @@ process.stdin.on("data", () => process.stdout.write("not-json\\n"));
   assert.equal(runtime.entries.length, 0);
 });
 
-test("a successful worker request does not emit a failure notification", { timeout: 15_000 }, async (t) => {
-  const workerDir = await mkdtemp(join(tmpdir(), "pi-session-memory-healthy-worker-"));
+test("the default python3.11 worker handles a JSONL request without warning", { timeout: 15_000 }, async (t) => {
+  const workerDir = await mkdtemp(join(tmpdir(), "pi-session-memory-default-worker-"));
   const workerScript = join(workerDir, "fake-worker.js");
-  const fakePython = join(workerDir, "fake-python");
+  const python311 = join(workerDir, "python3.11");
   const requestsFile = join(workerDir, "requests.txt");
+  const selectedFile = join(workerDir, "selected-interpreter.txt");
   await writeFile(workerScript, `
 const fs = require("node:fs");
 let input = "";
@@ -327,21 +328,23 @@ process.stdin.on("data", (chunk) => {
   while (newline >= 0) {
     const request = JSON.parse(input.slice(0, newline));
     input = input.slice(newline + 1);
-    fs.appendFileSync(process.env.PI_SESSION_MEMORY_TEST_REQUESTS, request.gate + "\\n");
+    fs.appendFileSync(process.env.PI_SESSION_MEMORY_TEST_REQUESTS, JSON.stringify(request) + "\\n");
     process.stdout.write(JSON.stringify({ protocol_version: 1, request_id: request.request_id, gate: request.gate, status: "ok", decision: { accepted: true, p_true: 0.95, confidence: 0.9 } }) + "\\n");
     newline = input.indexOf("\\n");
   }
 });
 `);
-  await writeFile(fakePython, '#!/bin/sh\nexec "$PI_SESSION_MEMORY_TEST_NODE" "$PI_SESSION_MEMORY_TEST_WORKER"\n');
-  await chmod(fakePython, 0o755);
+  await writeFile(python311, '#!/bin/sh\nprintf \'python3.11\\n\' >> "$PI_SESSION_MEMORY_TEST_SELECTED"\nexec "$PI_SESSION_MEMORY_TEST_NODE" "$PI_SESSION_MEMORY_TEST_WORKER"\n');
+  await chmod(python311, 0o755);
 
-  const envKeys = ["PI_SESSION_MEMORY_PYTHON", "PI_SESSION_MEMORY_TEST_NODE", "PI_SESSION_MEMORY_TEST_WORKER", "PI_SESSION_MEMORY_TEST_REQUESTS"];
+  const envKeys = ["PI_SESSION_MEMORY_PYTHON", "PATH", "PI_SESSION_MEMORY_TEST_NODE", "PI_SESSION_MEMORY_TEST_WORKER", "PI_SESSION_MEMORY_TEST_REQUESTS", "PI_SESSION_MEMORY_TEST_SELECTED"];
   const previousEnv = new Map(envKeys.map((key) => [key, process.env[key]]));
-  process.env.PI_SESSION_MEMORY_PYTHON = fakePython;
+  delete process.env.PI_SESSION_MEMORY_PYTHON;
+  process.env.PATH = workerDir;
   process.env.PI_SESSION_MEMORY_TEST_NODE = process.execPath;
   process.env.PI_SESSION_MEMORY_TEST_WORKER = workerScript;
   process.env.PI_SESSION_MEMORY_TEST_REQUESTS = requestsFile;
+  process.env.PI_SESSION_MEMORY_TEST_SELECTED = selectedFile;
 
   const runtime = testRuntime({ enabled: false, useRealWorker: true });
   t.after(async () => {
@@ -355,7 +358,14 @@ process.stdin.on("data", (chunk) => {
 
   await runtime.start();
   await runtime.turn({ userId: "user-worker-success", assistantId: "assistant-worker-success", userText: "Synthetic successful worker check.", inputTokens: 1 });
-  assert.equal((await readFile(requestsFile, "utf8")).trim(), "observation", "the fake worker must accept the real extension's JSONL request");
+  assert.equal(await readFile(selectedFile, "utf8").catch(() => ""), "python3.11\n", "the extension default must resolve python3.11 from the controlled PATH");
+  const request = JSON.parse((await readFile(requestsFile, "utf8")).trim());
+  assert.equal(request.protocol_version, 1);
+  assert.equal(request.gate, "observation");
+  assert.equal(typeof request.request_id, "string");
+  assert.equal(typeof request.state, "string");
+  assert.ok(Buffer.byteLength(request.state) <= 8_192, "gate state must remain bounded");
+  assert.ok(Buffer.byteLength(JSON.stringify(request)) <= 16_384, "serialized JSONL request must remain bounded");
   assert.deepEqual(runtime.notifications, []);
   assert.equal(runtime.providerCalls.length, 0);
   await runtime.shutdown();

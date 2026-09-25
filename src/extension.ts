@@ -121,7 +121,7 @@ class LayaWorker {
   private start(): LayaWorkerProcess {
     if (this.child) return this.child;
     const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-    const python = process.env.PI_SESSION_MEMORY_PYTHON ?? "python3";
+    const python = process.env.PI_SESSION_MEMORY_PYTHON ?? "python3.11";
     const child = spawn(python, ["-m", "worker"], { cwd: projectRoot, stdio: ["pipe", "pipe", "ignore"] });
     this.child = child;
     const lines = createInterface({ input: child.stdout });
