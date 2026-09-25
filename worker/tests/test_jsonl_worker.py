@@ -11,7 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 class JsonlWorkerIntegrationTests(unittest.TestCase):
-    def test_one_process_serves_bounded_observation_and_reflection_requests(self):
+    def test_one_process_serves_bounded_formation_and_projection_requests(self):
         env = os.environ.copy()
         env.update(
             {
@@ -20,6 +20,23 @@ class JsonlWorkerIntegrationTests(unittest.TestCase):
                 "TRANSFORMERS_OFFLINE": "1",
                 "USE_TF": "0",
                 "TOKENIZERS_PARALLELISM": "false",
+            }
+        )
+        projection_state = json.dumps(
+            {
+                "need": "Which earlier decision keeps Pi session provenance exact while projecting only needed memory?",
+                "candidates": [
+                    {
+                        "entryId": "observation-relevant",
+                        "kind": "observation",
+                        "text": "Keep the Pi session canonical and append-only. Link observations to exact raw session entry IDs on the active branch; project only selected memory into request-local context without mutating history.",
+                    },
+                    {
+                        "entryId": "observation-unrelated",
+                        "kind": "observation",
+                        "text": "The UI theme can be changed in settings and the terminal supports multiple color palettes.",
+                    },
+                ],
             }
         )
         requests = [
@@ -43,6 +60,15 @@ class JsonlWorkerIntegrationTests(unittest.TestCase):
                 }
             ).encode()
             + b"\n",
+            json.dumps(
+                {
+                    "protocol_version": 1,
+                    "request_id": "projection-1",
+                    "gate": "projection",
+                    "state": projection_state,
+                }
+            ).encode()
+            + b"\n",
         ]
 
         result = subprocess.run(
@@ -60,13 +86,14 @@ class JsonlWorkerIntegrationTests(unittest.TestCase):
         self.assertEqual(len(lines), len(requests), result.stdout.decode(errors="replace"))
         self.assertLessEqual(max(map(len, lines)), 2_048)
         responses = [json.loads(line) for line in lines]
-        self.assertEqual([response["protocol_version"] for response in responses], [1, 1, 1, 1])
-        self.assertEqual([response["status"] for response in responses], ["error", "error", "ok", "ok"])
+        self.assertEqual([response["protocol_version"] for response in responses], [1, 1, 1, 1, 1])
+        self.assertEqual([response["status"] for response in responses], ["error", "error", "ok", "ok", "ok"])
         self.assertEqual(responses[0]["error"]["code"], "invalid_json")
         self.assertEqual(responses[1]["error"]["code"], "request_too_large")
-        self.assertEqual([response["request_id"] for response in responses[2:]], ["observation-1", "reflection-1"])
-        self.assertEqual([response["gate"] for response in responses[2:]], ["observation", "reflection"])
-        for response in responses[2:]:
+        self.assertEqual([response["request_id"] for response in responses[2:]], ["observation-1", "reflection-1", "projection-1"])
+        self.assertEqual([response["gate"] for response in responses[2:]], ["observation", "reflection", "projection"])
+        self.assertEqual(responses[4]["decision"], {"selected_entry_id": "observation-relevant"})
+        for response in responses[2:4]:
             self.assertEqual(response["status"], "ok")
             self.assertIsInstance(response["decision"]["accepted"], bool)
             self.assertTrue(math.isfinite(response["decision"]["p_true"]))

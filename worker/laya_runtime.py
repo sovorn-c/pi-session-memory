@@ -15,7 +15,7 @@ import time
 from urllib.parse import unquote, urlparse
 import warnings
 
-from worker.protocol import Gate, GateDecision, GateRequest
+from worker.protocol import Gate, GateDecision, GateRequest, ProjectionDecision
 
 
 LAYA_SOURCE_COMMIT = "010bacef009c855ccba814b51f7c8e1d38ab5e3f"
@@ -27,6 +27,10 @@ DEFAULT_CHECKPOINT = (
     / CHECKPOINT_REVISION
 )
 Question = dict[str, str | dict[str, str]]
+MAX_PROJECTION_CANDIDATES = 8
+MAX_PROJECTION_NEED_CHARS = 800
+MAX_CANDIDATE_TEXT_CHARS = 500
+NO_CANDIDATE = "none"
 QUESTIONS: dict[Gate, Question] = {
     "observation": {
         "type": "noul",
@@ -50,6 +54,17 @@ QUESTIONS: dict[Gate, Question] = {
         "criteria": {
             "true": "Multiple observations support a stable, useful cross-turn synthesis.",
             "false": "Evidence is unrelated, isolated, transient, or does not support a distinct synthesis.",
+        },
+    },
+    "resident": {
+        "type": "noul",
+        "instructions": (
+            "Is the already resident, linked session memory sufficient to address this current need without "
+            "retrieving another memory entry? Answer yes only when its evidence directly covers the request."
+        ),
+        "criteria": {
+            "true": "The resident source-linked memory directly covers the current need.",
+            "false": "The resident memory is insufficient or unrelated to the current need.",
         },
     },
 }
@@ -122,6 +137,44 @@ def _probability(value: object) -> float:
     return result
 
 
+def _projection_state(state: str) -> tuple[str, list[tuple[str, str, str]]]:
+    try:
+        value: object = json.loads(state)
+    except json.JSONDecodeError:
+        raise ValueError("projection state is invalid JSON") from None
+    if not isinstance(value, dict) or set(value) != {"need", "candidates"}:
+        raise ValueError("projection state fields are invalid")
+    need = value["need"]
+    candidates = value["candidates"]
+    if not isinstance(need, str) or not need or len(need) > MAX_PROJECTION_NEED_CHARS:
+        raise ValueError("projection need is invalid")
+    if not isinstance(candidates, list) or not candidates or len(candidates) > MAX_PROJECTION_CANDIDATES:
+        raise ValueError("projection candidates are empty or exceed the bound")
+
+    parsed: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not isinstance(candidate, dict) or set(candidate) != {"entryId", "kind", "text"}:
+            raise ValueError("projection candidate fields are invalid")
+        entry_id = candidate["entryId"]
+        kind = candidate["kind"]
+        text = candidate["text"]
+        if (
+            not isinstance(entry_id, str)
+            or not entry_id
+            or len(entry_id) > 256
+            or entry_id in seen
+            or kind not in ("observation", "reflection")
+            or not isinstance(text, str)
+            or not text
+            or len(text) > MAX_CANDIDATE_TEXT_CHARS
+        ):
+            raise ValueError("projection candidate is invalid")
+        seen.add(entry_id)
+        parsed.append((entry_id, kind, text))
+    return need, parsed
+
+
 class LayaEvaluator:
     def __init__(self) -> None:
         from laya.agent import Agent
@@ -154,7 +207,9 @@ class LayaEvaluator:
             warnings=tuple(str(warning.message) for warning in captured_warnings),
         )
 
-    def evaluate(self, request: GateRequest) -> GateDecision:
+    def evaluate(self, request: GateRequest) -> GateDecision | ProjectionDecision:
+        if request.gate == "projection":
+            return self._select_projection(request)
         result = self.agent.system_one(
             {"gate": request.gate, "evidence": request.state},
             {"warranted": QUESTIONS[request.gate]},
@@ -168,3 +223,36 @@ class LayaEvaluator:
         p_true = _probability(answer.get("noul"))
         confidence = _probability(answer.get("confidence"))
         return GateDecision(accepted=p_true >= 0.5, p_true=round(p_true, 4), confidence=round(confidence, 4))
+
+    def _select_projection(self, request: GateRequest) -> ProjectionDecision:
+        need, candidates = _projection_state(request.state)
+        labels = {f"candidate_{index}": f"{kind}: {text}" for index, (_, kind, text) in enumerate(candidates)}
+        labels[NO_CANDIDATE] = "None of these source-linked memories is relevant to the current need."
+        result = self.agent.system_one(
+            {"gate": request.gate, "current_need": need},
+            {
+                "selected": {
+                    "type": "choice",
+                    "instructions": "Which one bounded memory candidate is most relevant to the current need? Select none if no candidate is relevant.",
+                    "criteria": labels,
+                },
+            },
+        )
+        answers = result.get("answers")
+        if not isinstance(answers, dict):
+            raise ValueError("Laya returned no typed selection")
+        answer = answers.get("selected")
+        if not isinstance(answer, dict) or answer.get("type") != "choice":
+            raise ValueError("Laya returned an unexpected selection type")
+        selected = answer.get("choice")
+        if selected == NO_CANDIDATE:
+            return ProjectionDecision(selected_entry_id=None)
+        if not isinstance(selected, str) or not selected.startswith("candidate_"):
+            raise ValueError("Laya returned an unknown selection")
+        try:
+            index = int(selected.removeprefix("candidate_"))
+        except ValueError:
+            raise ValueError("Laya returned an unknown selection") from None
+        if index < 0 or index >= len(candidates) or selected != f"candidate_{index}":
+            raise ValueError("Laya returned an unknown selection")
+        return ProjectionDecision(selected_entry_id=candidates[index][0])

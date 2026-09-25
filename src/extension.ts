@@ -5,6 +5,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext, SessionEntry, SessionStartEvent, TurnEndEvent } from "@earendil-works/pi-coding-agent";
 import { registerHydration } from "./hydration.ts";
+import { registerProjection, type ProjectionGateRequest, type ProjectionSelectionDecision } from "./projection.ts";
 
 const OBSERVATION_TYPE = "pi-session-memory.observation";
 const REFLECTION_TYPE = "pi-session-memory.reflection";
@@ -21,7 +22,7 @@ const ENABLE_FLAG = "e01-memory-generation";
 const DISCLOSURE =
   "Session-derived text and its source entry IDs will be sent to the currently configured Pi model/provider only after a local Laya gate accepts. Laya runs locally. The Pi session remains canonical; generated memories are appended as non-context session entries. Do you allow this for the current session?";
 
-export type FormationGate = "observation" | "reflection";
+export type FormationGate = "observation" | "reflection" | "resident" | "projection";
 export interface GateRequest {
   gate: FormationGate;
   state: string;
@@ -31,7 +32,8 @@ export interface GateDecision {
   p_true: number;
   confidence: number;
 }
-type GateEvaluator = (request: GateRequest) => Promise<GateDecision>;
+type GateResult = GateDecision | ProjectionSelectionDecision;
+type GateEvaluator = (request: GateRequest) => Promise<GateResult>;
 interface WorkerTimeoutScheduler {
   setTimeout(callback: () => void, delayMs: number): ReturnType<typeof setTimeout>;
   clearTimeout(timer: ReturnType<typeof setTimeout>): void;
@@ -73,7 +75,7 @@ interface LinkedObservation {
 class LayaWorker {
   private child: ChildProcessWithoutNullStreams | undefined;
   private lines: ReadlineInterface | undefined;
-  private pending: { requestId: string; gate: FormationGate; resolve: (decision: GateDecision) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> } | undefined;
+  private pending: { requestId: string; gate: FormationGate; resolve: (decision: GateResult) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> } | undefined;
   private queue: Promise<void> = Promise.resolve();
   private readonly timeoutScheduler: WorkerTimeoutScheduler;
 
@@ -81,8 +83,8 @@ class LayaWorker {
     this.timeoutScheduler = timeoutScheduler;
   }
 
-  request(request: GateRequest): Promise<GateDecision> {
-    const queued = this.queue.then(() => new Promise<GateDecision>((resolveResult, rejectResult) => {
+  request(request: GateRequest): Promise<GateResult> {
+    const queued = this.queue.then(() => new Promise<GateResult>((resolveResult, rejectResult) => {
       const child = this.start();
       const requestId = randomUUID();
       const timer = this.timeoutScheduler.setTimeout(() => this.fail(new Error("Laya worker request timed out"), child), WORKER_REQUEST_TIMEOUT_MS);
@@ -135,6 +137,16 @@ class LayaWorker {
     if (!isRecord(payload) || payload.protocol_version !== PROTOCOL_VERSION || payload.request_id !== pending.requestId || payload.gate !== pending.gate || payload.status !== "ok" || !isRecord(payload.decision)) {
       return this.fail(new Error("Untrusted Laya worker response"), child);
     }
+    if (pending.gate === "projection") {
+      const selected_entry_id = payload.decision.selected_entry_id;
+      if (selected_entry_id !== null && typeof selected_entry_id !== "string") {
+        return this.fail(new Error("Invalid Laya worker selection"), child);
+      }
+      this.timeoutScheduler.clearTimeout(pending.timer);
+      this.pending = undefined;
+      pending.resolve({ selected_entry_id });
+      return;
+    }
     const { accepted, p_true, confidence } = payload.decision;
     if (typeof accepted !== "boolean" || !isProbability(p_true) || !isProbability(confidence)) {
       return this.fail(new Error("Invalid Laya worker decision"), child);
@@ -173,7 +185,7 @@ export function registerFormation(pi: ExtensionAPI, options: FormationOptions = 
   let worker: LayaWorker | undefined;
   let workerSessionId: string | undefined;
 
-  const gate = (sessionId: string, request: GateRequest): Promise<GateDecision> => {
+  const gate = (sessionId: string, request: GateRequest): Promise<GateResult> => {
     if (evaluateGate) return evaluateGate(request);
     if (workerSessionId !== sessionId) {
       worker?.stop();
@@ -183,6 +195,8 @@ export function registerFormation(pi: ExtensionAPI, options: FormationOptions = 
     worker ??= new LayaWorker(timeoutScheduler);
     return worker.request(request);
   };
+
+  const clearProjection = registerProjection(pi, (sessionId, request: ProjectionGateRequest) => gate(sessionId, request));
 
   pi.on("session_start", (event: SessionStartEvent, ctx: ExtensionContext) => {
     const sessionId = ctx.sessionManager.getSessionId();
@@ -215,6 +229,7 @@ export function registerFormation(pi: ExtensionAPI, options: FormationOptions = 
     cadenceBySession.clear();
     consentedSessions.clear();
     pendingTurns.clear();
+    clearProjection();
   });
 }
 
@@ -255,7 +270,7 @@ async function formForTurn(
       const state = encodeGateState({ sourceEntryIds: sources.map(({ entryId }) => entryId), sources });
       if (state) {
         const decision = await gate(sessionId, { gate: "observation", state });
-        if (decision.accepted) await generateObservation(pi, ctx, sessionId, sources, consentedSessions);
+        if (isGateDecision(decision) && decision.accepted) await generateObservation(pi, ctx, sessionId, sources, consentedSessions);
       }
     }
   }
@@ -266,7 +281,7 @@ async function formForTurn(
       const state = encodeGateState({ observations: observations.map(({ entryId, data }) => ({ entryId, text: data.text, sourceEntryIds: data.sourceEntryIds })) });
       if (state) {
         const decision = await gate(sessionId, { gate: "reflection", state });
-        if (decision.accepted) await generateReflection(pi, ctx, sessionId, observations, consentedSessions);
+        if (isGateDecision(decision) && decision.accepted) await generateReflection(pi, ctx, sessionId, observations, consentedSessions);
       }
     }
   }
@@ -432,6 +447,10 @@ function parseCadence(value: boolean | string | undefined): number | undefined {
   if (typeof value !== "string" || !/^\d+$/.test(value)) return undefined;
   const parsed = Number(value);
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+function isGateDecision(value: GateResult): value is GateDecision {
+  return "accepted" in value && typeof value.accepted === "boolean" && isProbability(value.p_true) && isProbability(value.confidence);
 }
 
 function isProbability(value: unknown): value is number {

@@ -7,7 +7,7 @@ import re
 from typing import BinaryIO, Callable, Literal, TextIO, TypeAlias
 
 
-Gate: TypeAlias = Literal["observation", "reflection"]
+Gate: TypeAlias = Literal["observation", "reflection", "resident", "projection"]
 ErrorCode: TypeAlias = Literal["invalid_json", "invalid_request", "request_too_large", "laya_error"]
 PROTOCOL_VERSION = 1
 MAX_REQUEST_BYTES = 16_384
@@ -28,6 +28,11 @@ class GateDecision:
     accepted: bool
     p_true: float
     confidence: float
+
+
+@dataclass(frozen=True)
+class ProjectionDecision:
+    selected_entry_id: str | None
 
 
 @dataclass(frozen=True)
@@ -57,6 +62,10 @@ def parse_request(line: bytes) -> GateRequest:
         typed_gate: Gate = "observation"
     elif gate == "reflection":
         typed_gate = "reflection"
+    elif gate == "resident":
+        typed_gate = "resident"
+    elif gate == "projection":
+        typed_gate = "projection"
     else:
         raise ProtocolError("invalid_request")
     state = payload["state"]
@@ -99,7 +108,7 @@ def serve(
     input_stream: BinaryIO,
     output_stream: BinaryIO,
     diagnostics: TextIO,
-    evaluate: Callable[[GateRequest], GateDecision],
+    evaluate: Callable[[GateRequest], GateDecision | ProjectionDecision],
 ) -> None:
     while line := input_stream.readline(MAX_REQUEST_BYTES + 1):
         if len(line) > MAX_REQUEST_BYTES:
