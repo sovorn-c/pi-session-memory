@@ -1,0 +1,78 @@
+import json
+import math
+import os
+from pathlib import Path
+import subprocess
+import sys
+import unittest
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+class JsonlWorkerIntegrationTests(unittest.TestCase):
+    def test_one_process_serves_bounded_observation_and_reflection_requests(self):
+        env = os.environ.copy()
+        env.update(
+            {
+                "HF_HOME": "/Users/sovorn/.cache/pi-session-memory/bp-init-laya-010bacef/hf",
+                "HF_HUB_OFFLINE": "1",
+                "TRANSFORMERS_OFFLINE": "1",
+                "USE_TF": "0",
+                "TOKENIZERS_PARALLELISM": "false",
+            }
+        )
+        requests = [
+            b'{"protocol_version":1,"request_id":"bad-json","gate":\n',
+            b"x" * 20_000 + b"\n",
+            json.dumps(
+                {
+                    "protocol_version": 1,
+                    "request_id": "observation-1",
+                    "gate": "observation",
+                    "state": "A user decided that the Pi session remains canonical and every retained observation must cite exact source entry IDs.",
+                }
+            ).encode()
+            + b"\n",
+            json.dumps(
+                {
+                    "protocol_version": 1,
+                    "request_id": "reflection-1",
+                    "gate": "reflection",
+                    "state": "Across three turns, the user repeatedly chose exact source links, append-only history, and native Pi context whenever memory is uncertain.",
+                }
+            ).encode()
+            + b"\n",
+        ]
+
+        result = subprocess.run(
+            [sys.executable, "-m", "worker"],
+            cwd=PROJECT_ROOT,
+            env=env,
+            input=b"".join(requests),
+            capture_output=True,
+            check=False,
+            timeout=180,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+        lines = result.stdout.splitlines()
+        self.assertEqual(len(lines), len(requests), result.stdout.decode(errors="replace"))
+        self.assertLessEqual(max(map(len, lines)), 2_048)
+        responses = [json.loads(line) for line in lines]
+        self.assertEqual([response["protocol_version"] for response in responses], [1, 1, 1, 1])
+        self.assertEqual([response["status"] for response in responses], ["error", "error", "ok", "ok"])
+        self.assertEqual(responses[0]["error"]["code"], "invalid_json")
+        self.assertEqual(responses[1]["error"]["code"], "request_too_large")
+        self.assertEqual([response["request_id"] for response in responses[2:]], ["observation-1", "reflection-1"])
+        self.assertEqual([response["gate"] for response in responses[2:]], ["observation", "reflection"])
+        for response in responses[2:]:
+            self.assertEqual(response["status"], "ok")
+            self.assertIsInstance(response["decision"]["accepted"], bool)
+            self.assertTrue(math.isfinite(response["decision"]["p_true"]))
+            self.assertGreaterEqual(response["decision"]["p_true"], 0.0)
+            self.assertLessEqual(response["decision"]["p_true"], 1.0)
+
+
+if __name__ == "__main__":
+    unittest.main()
