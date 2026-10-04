@@ -1,4 +1,4 @@
-import type { ExtensionAPI, SessionEntry } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 
 const OBSERVATION_TYPE = "pi-session-memory.observation";
 const REFLECTION_TYPE = "pi-session-memory.reflection";
@@ -7,6 +7,7 @@ const MAX_RAW_SOURCES = 12;
 const MAX_REFLECTION_SOURCES = 6;
 const MAX_ENTRY_ID_CHARS = 256;
 const MAX_HYDRATION_OUTPUT_CHARS = 16_000;
+const HYDRATION_LIMIT_NOTICE = "Session memory has raw evidence larger than the hydration limit; continuing with available detail.";
 
 const HydrationParams = {
   type: "object",
@@ -60,6 +61,7 @@ export function registerHydration(pi: ExtensionAPI): void {
       const projection = hydrate(ctx.sessionManager.getBranch(), params);
       const text = JSON.stringify(projection);
       if (text.length > MAX_HYDRATION_OUTPUT_CHARS) throw new Error("Hydration result exceeded its output bound");
+      if (projection.unavailableDetails?.length) reportHydrationLimit(ctx);
       return {
         content: [{ type: "text", text }],
         details: {
@@ -71,6 +73,16 @@ export function registerHydration(pi: ExtensionAPI): void {
       };
     },
   });
+}
+
+function reportHydrationLimit(ctx: ExtensionContext): void {
+  if (ctx.hasUI) {
+    try {
+      ctx.ui.notify(HYDRATION_LIMIT_NOTICE, "warning");
+      return;
+    } catch {}
+  }
+  process.stderr.write(`${HYDRATION_LIMIT_NOTICE}\n`);
 }
 
 function hydrate(branch: SessionEntry[], params: HydrationParamsValue): HydrationProjection {
@@ -117,6 +129,7 @@ function hydrate(branch: SessionEntry[], params: HydrationParamsValue): Hydratio
     if (!isObservationData(entry.data)) throw new Error("Observation entry has an unsupported or invalid schema");
     observationsById.set(id, entry.data);
   }
+  const requestedRawId = params.depth === "raw" ? params.entryId : undefined;
   const selectedObservationIds = params.depth === "observation" && params.entryId !== undefined
     ? linkedObservationIds.includes(params.entryId) ? [params.entryId] : []
     : linkedObservationIds;
@@ -127,10 +140,13 @@ function hydrate(branch: SessionEntry[], params: HydrationParamsValue): Hydratio
     const data = observationsById.get(entryId);
     return data === undefined ? [] : [{ entryId, data }];
   });
+  const observationsToProject = requestedRawId === undefined
+    ? observations
+    : observations.filter(({ data }) => data.sourceEntryIds.includes(requestedRawId));
   if (projection.missingIds.length > 0) projection.status = "partial";
 
   projection.observations = [];
-  for (const observation of observations) {
+  for (const observation of observationsToProject) {
     const candidate = { entryId: observation.entryId, text: observation.data.text, sourceEntryIds: observation.data.sourceEntryIds };
     projection.observations.push(candidate);
     projection.nextDetail = { depth: "observation", entryId: observation.entryId };
@@ -140,16 +156,27 @@ function hydrate(branch: SessionEntry[], params: HydrationParamsValue): Hydratio
       break;
     }
   }
-  if (projection.observations.length < observations.length) {
-    const nextObservation = observations[projection.observations.length];
-    projection.nextDetail = { depth: "observation", entryId: nextObservation.entryId };
-    return projection;
+  if (projection.observations.length < observationsToProject.length) {
+    if (requestedRawId === undefined) {
+      const nextObservation = observationsToProject[projection.observations.length];
+      projection.nextDetail = { depth: "observation", entryId: nextObservation.entryId };
+      return projection;
+    }
+    projection.observations = [];
   }
 
   projection.nextDetail = projection.observations.length > 0 ? { depth: "raw" } : null;
   if (params.depth === "observation") return projection;
 
   const rawIds = [...new Set(observations.flatMap(({ data }) => data.sourceEntryIds))];
+  const selectedRawIds = requestedRawId === undefined
+    ? rawIds
+    : rawIds.includes(requestedRawId) ? [requestedRawId] : [];
+  if (requestedRawId !== undefined && selectedRawIds.length === 0) {
+    projection.status = "partial";
+    projection.missingIds.push(requestedRawId);
+  }
+
   const rawEntriesById = new Map<string, SessionEntry>();
   const unavailableRawIds: string[] = [];
   for (const id of rawIds) {
@@ -161,10 +188,25 @@ function hydrate(branch: SessionEntry[], params: HydrationParamsValue): Hydratio
     }
     rawEntriesById.set(id, entry);
   }
+  const nextRawPointer = (entryId: string): HydrationPointer | null => {
+    const nextId = rawIds.slice(rawIds.indexOf(entryId) + 1).find((id) => rawEntriesById.has(id));
+    return nextId === undefined ? null : { depth: "raw", entryId: nextId };
+  };
+  const rawIdsToCheck = params.entryId === undefined ? rawIds : selectedRawIds;
   while (true) {
-    const newlyUnavailable = [...rawEntriesById]
-      .filter(([, entry]) => !fitsOutputBound({ ...projection, rawEntries: [entry] }))
-      .map(([id]) => id);
+    const newlyUnavailable = rawIdsToCheck
+      .filter((id) => {
+        const entry = rawEntriesById.get(id);
+        if (entry === undefined) return false;
+        const candidate = {
+          ...projection,
+          status: "partial",
+          observations: [],
+          rawEntries: [entry],
+          nextDetail: nextRawPointer(id),
+        };
+        return !fitsOutputBound(candidate);
+      });
     if (newlyUnavailable.length === 0) break;
     for (const id of newlyUnavailable) {
       rawEntriesById.delete(id);
@@ -178,33 +220,31 @@ function hydrate(branch: SessionEntry[], params: HydrationParamsValue): Hydratio
     }));
   }
 
-  const selectedRawIds = params.entryId === undefined
-    ? rawIds
-    : rawIds.includes(params.entryId) ? [params.entryId] : [];
-  if (params.entryId !== undefined && selectedRawIds.length === 0) {
-    projection.status = "partial";
-    projection.missingIds.push(params.entryId);
-  }
-
   projection.rawEntries = [];
-  const selectedRawIndex = params.entryId === undefined ? -1 : rawIds.indexOf(params.entryId);
-  projection.nextDetail = null;
+  projection.status = "partial";
+  projection.nextDetail = requestedRawId !== undefined && rawIds.includes(requestedRawId)
+    ? nextRawPointer(requestedRawId) : null;
   for (const id of selectedRawIds) {
     const entry = rawEntriesById.get(id);
     if (entry === undefined) continue;
     projection.rawEntries.push(entry);
+    projection.nextDetail = nextRawPointer(id);
     if (!fitsOutputBound(projection)) {
       projection.rawEntries.pop();
+      if (params.entryId === id && projection.observations?.length) {
+        const supportingObservations = projection.observations;
+        projection.observations = [];
+        projection.rawEntries.push(entry);
+        if (fitsOutputBound(projection)) continue;
+        projection.rawEntries.pop();
+        projection.observations = supportingObservations;
+      }
       projection.status = "partial";
       projection.nextDetail = { depth: "raw", entryId: id };
       break;
     }
   }
-  if (params.entryId !== undefined && selectedRawIndex >= 0) {
-    const nextRawId = rawIds.slice(selectedRawIndex + 1).find((id) => rawEntriesById.has(id));
-    projection.nextDetail = nextRawId === undefined ? null : { depth: "raw", entryId: nextRawId };
-  }
-
+  if (!fitsOutputBound(projection)) projection.observations = [];
   projection.exactEvidenceRecovered = projection.missingIds.length === 0 &&
     unavailableRawIds.length === 0 && projection.rawEntries.length === rawIds.length;
   projection.status = projection.exactEvidenceRecovered ? "complete" : "partial";

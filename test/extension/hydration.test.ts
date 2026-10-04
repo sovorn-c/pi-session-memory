@@ -5,19 +5,47 @@ import { registerHydration } from "../../src/hydration.ts";
 function hydrationTool(branch) {
   let tool;
   let branchReads = 0;
+  const notifications = [];
   registerHydration({
     registerTool(definition) { tool = definition; },
   });
   return {
     tool,
+    notifications,
     get branchReads() { return branchReads; },
-    context: { sessionManager: { getBranch: () => { branchReads += 1; return branch; } } },
+    context: {
+      hasUI: true,
+      ui: { notify: (message, type) => notifications.push({ message, type }) },
+      sessionManager: { getBranch: () => { branchReads += 1; return branch; } },
+    },
   };
 }
 
 function resultData(result) {
   return JSON.parse(result.content[0].text);
 }
+
+test("registering hydration does not resolve a valid resident reflection's branch without tool execution", () => {
+  const raw = messageEntry("raw-sufficient", "user", "The resident reflection already answers this request.");
+  const observation = {
+    type: "custom",
+    id: "observation-sufficient",
+    customType: "pi-session-memory.observation",
+    data: { schemaVersion: 1, text: "The resident reflection has valid support.", sourceEntryIds: [raw.id] },
+  };
+  const reflection = {
+    type: "custom",
+    id: "reflection-sufficient",
+    customType: "pi-session-memory.reflection",
+    data: { schemaVersion: 1, text: "All detail needed for this request is resident.", supportingObservationIds: [observation.id] },
+  };
+  const branch = [raw, observation, reflection];
+  const before = structuredClone(branch);
+  const runtime = hydrationTool(branch);
+
+  assert.equal(runtime.branchReads, 0, "registering the model-callable tool must not eagerly hydrate session entries");
+  assert.deepEqual(branch, before, "a no-request path must leave the durable branch untouched");
+});
 
 function messageEntry(id, role, text) {
   return {
@@ -173,6 +201,10 @@ test("keeps oversized raw support bounded and terminates with an honest unavaila
     assert.deepEqual(projection.unavailableDetails, [{ depth: "raw", entryId: raw.id, reason: "result_exceeds_output_bound" }]);
   }
   assert.equal(projection.nextDetail, null);
+  assert.deepEqual(runtime.notifications, [{
+    message: "Session memory has raw evidence larger than the hydration limit; continuing with available detail.",
+    type: "warning",
+  }], "Pi should show a warning while returning the bounded partial result normally");
 });
 
 test("does not claim complete recovery for one selected raw entry when another support link is missing", async () => {
@@ -202,6 +234,220 @@ test("does not claim complete recovery for one selected raw entry when another s
   assert.deepEqual(projection.missingIds, ["raw-missing"]);
   assert.equal(projection.exactEvidenceRecovered, false, "one present entry must not imply complete chain recovery");
   assert.equal(projection.nextDetail, null, "do not point to a known missing linked entry");
+});
+
+test("retrieves a fitting targeted raw entry despite unrelated near-limit observations", async () => {
+  const rawEntries = Array.from({ length: 6 }, (_, index) => messageEntry(
+    `raw-mixed-${index + 1}`,
+    "user",
+    index === 0 ? "x".repeat(10_800) : `Supporting source ${index + 1}.`,
+  ));
+  const observations = rawEntries.map((raw, index) => ({
+    type: "custom",
+    id: `observation-mixed-${index + 1}`,
+    customType: "pi-session-memory.observation",
+    data: { schemaVersion: 1, text: `Observation ${index + 1}: ${"detail ".repeat(120)}`, sourceEntryIds: [raw.id] },
+  }));
+  const reflection = {
+    type: "custom",
+    id: "reflection-mixed",
+    customType: "pi-session-memory.reflection",
+    data: { schemaVersion: 1, text: "A concise reflection backed by several detailed observations.", supportingObservationIds: observations.map(({ id }) => id) },
+  };
+  const runtime = hydrationTool([...rawEntries, ...observations, reflection]);
+
+  const firstResult = resultData(await runtime.tool.execute("call-1", {
+    reflectionId: reflection.id,
+    depth: "raw",
+  }, undefined, undefined, runtime.context));
+  assert.deepEqual(firstResult.nextDetail, { depth: "raw", entryId: rawEntries[0].id }, "a fitting entry that exceeds the aggregate projection is offered as a targeted next step");
+  assert.equal(firstResult.unavailableDetails, undefined, "aggregate overflow must not classify a fitting entry as individually unavailable");
+
+  const result = await runtime.tool.execute("call-2", {
+    reflectionId: reflection.id,
+    depth: "raw",
+    entryId: rawEntries[0].id,
+  }, undefined, undefined, runtime.context);
+  const text = result.content[0].text;
+  const projection = JSON.parse(text);
+
+  assert.ok(text.length <= 16_000, "targeted raw hydration remains bounded");
+  assert.deepEqual(projection.observations.map(({ entryId }) => entryId), [observations[0].id], "the result retains the provenance observation for the exact raw entry");
+  assert.deepEqual(projection.rawEntries, [rawEntries[0]], "unrelated observations must not make a fitting exact raw entry unavailable");
+  assert.equal(projection.unavailableDetails, undefined);
+  assert.equal(projection.exactEvidenceRecovered, false, "one target page does not claim the rest of the linked raw chain was recovered");
+  assert.deepEqual(projection.nextDetail, { depth: "raw", entryId: rawEntries[1].id }, "the next linked raw entry remains pageable");
+});
+
+test("returns a fitting raw entry when its observation would exceed the shared output bound", async () => {
+  const raw = messageEntry("raw-source-large", "user", "r".repeat(15_000));
+  const observation = {
+    type: "custom",
+    id: "observation-source-large",
+    customType: "pi-session-memory.observation",
+    data: { schemaVersion: 1, text: "o".repeat(1_000), sourceEntryIds: [raw.id] },
+  };
+  const reflection = {
+    type: "custom",
+    id: "reflection-source-large",
+    customType: "pi-session-memory.reflection",
+    data: { schemaVersion: 1, text: "The exact source is retrievable.", supportingObservationIds: [observation.id] },
+  };
+  const runtime = hydrationTool([raw, observation, reflection]);
+
+  const result = await runtime.tool.execute("call-1", {
+    reflectionId: reflection.id,
+    depth: "raw",
+    entryId: raw.id,
+  }, undefined, undefined, runtime.context);
+  const text = result.content[0].text;
+  const projection = JSON.parse(text);
+
+  assert.ok(text.length <= 16_000);
+  assert.deepEqual(projection.rawEntries, [raw], "the raw source fits even though the observation plus source does not");
+  assert.deepEqual(projection.observations, [], "the fitting exact raw entry takes priority over its over-bound observation text");
+  assert.equal(projection.unavailableDetails, undefined);
+  assert.equal(projection.exactEvidenceRecovered, true);
+  assert.equal(projection.nextDetail, null);
+});
+
+test("budgets maximum-length continuation IDs with near-limit targeted raw evidence", async () => {
+  const raw = messageEntry("raw-near-bound", "user", "");
+  const nextRaw = messageEntry("n".repeat(256), "user", "Next exact source.");
+  const observation = {
+    type: "custom",
+    id: "observation-near-bound",
+    customType: "pi-session-memory.observation",
+    data: { schemaVersion: 1, text: "o".repeat(1_000), sourceEntryIds: [raw.id, nextRaw.id] },
+  };
+  const reflection = {
+    type: "custom",
+    id: "reflection-near-bound",
+    customType: "pi-session-memory.reflection",
+    data: { schemaVersion: 1, text: "Two exact sources.", supportingObservationIds: [observation.id] },
+  };
+  const runtime = hydrationTool([raw, nextRaw, observation, reflection]);
+  const params = { reflectionId: reflection.id, depth: "raw", entryId: raw.id };
+  const baseline = resultData(await runtime.tool.execute("baseline", params, undefined, undefined, runtime.context));
+  baseline.observations = [];
+  baseline.nextDetail = null;
+  const overhead = JSON.stringify(baseline).length;
+
+  for (const remainingChars of [100, 400]) {
+    raw.message.content[0].text = "x".repeat(16_000 - overhead - remainingChars);
+    const result = await runtime.tool.execute(`target-${remainingChars}`, params, undefined, undefined, runtime.context);
+    const projection = resultData(result);
+    assert.ok(result.content[0].text.length <= 16_000);
+    assert.equal(projection.status, "partial");
+    assert.equal(projection.exactEvidenceRecovered, false);
+    assert.deepEqual(projection.nextDetail, { depth: "raw", entryId: nextRaw.id });
+    if (remainingChars === 100) {
+      assert.deepEqual(projection.rawEntries, []);
+      assert.deepEqual(projection.unavailableDetails, [{ depth: "raw", entryId: raw.id, reason: "result_exceeds_output_bound" }]);
+    } else {
+      assert.deepEqual(projection.rawEntries, [raw]);
+      assert.deepEqual(projection.observations, []);
+      assert.equal(projection.unavailableDetails, undefined);
+    }
+    const followup = resultData(await runtime.tool.execute(`next-${remainingChars}`, {
+      ...params, entryId: projection.nextDetail.entryId,
+    }, undefined, undefined, runtime.context));
+    assert.deepEqual(followup.rawEntries, [nextRaw]);
+    assert.equal(followup.nextDetail, null);
+  }
+});
+
+test("selects a later raw entry before budgeting observations with maximum-length source IDs", async () => {
+  const sourceGroups = Array.from({ length: 6 }, (_, observationIndex) =>
+    Array.from({ length: 12 }, (_, sourceIndex) => {
+      const prefix = `r${observationIndex}-${sourceIndex}-`;
+      return `${prefix}${"x".repeat(256 - prefix.length)}`;
+    }));
+  const rawEntries = sourceGroups.flatMap((ids) => ids.map((id) => messageEntry(id, "user", `Exact source ${id.slice(0, 8)}.`)));
+  const observations = sourceGroups.map((sourceEntryIds, index) => ({
+    type: "custom",
+    id: `observation-max-ids-${index + 1}`,
+    customType: "pi-session-memory.observation",
+    data: { schemaVersion: 1, text: `Observation ${index + 1}.`, sourceEntryIds },
+  }));
+  const reflection = {
+    type: "custom",
+    id: "reflection-max-ids",
+    customType: "pi-session-memory.reflection",
+    data: { schemaVersion: 1, text: "All six observations retain exact source links.", supportingObservationIds: observations.map(({ id }) => id) },
+  };
+  const missingId = sourceGroups[0][0];
+  const targetRawId = sourceGroups[5][4];
+  const targetRaw = rawEntries.find(({ id }) => id === targetRawId);
+  assert.ok(sourceGroups.flat().every((id) => id.length === 256));
+  const runtime = hydrationTool([
+    ...rawEntries.filter(({ id }) => id !== missingId),
+    ...observations,
+    reflection,
+  ]);
+
+  const result = await runtime.tool.execute("call-1", {
+    reflectionId: reflection.id,
+    depth: "raw",
+    entryId: targetRawId,
+  }, undefined, undefined, runtime.context);
+  const text = result.content[0].text;
+  const projection = JSON.parse(text);
+
+  assert.ok(text.length <= 16_000);
+  assert.deepEqual(projection.observations.map(({ entryId }) => entryId), [observations[5].id]);
+  assert.deepEqual(projection.rawEntries, [targetRaw], "target selection must happen before pagination over the full observation projection");
+  assert.deepEqual(projection.missingIds, [missingId], "missing raw links from unprojected observations remain visible");
+  assert.equal(projection.status, "partial");
+  assert.equal(projection.exactEvidenceRecovered, false);
+  assert.deepEqual(projection.nextDetail, { depth: "raw", entryId: sourceGroups[5][5] });
+});
+
+test("targeted raw hydration skips an over-bound bundle of supporting observations", async () => {
+  const targetRawId = `target-${"t".repeat(256 - "target-".length)}`;
+  const sourceGroups = Array.from({ length: 6 }, (_, observationIndex) => [
+    targetRawId,
+    ...Array.from({ length: 11 }, (_, sourceIndex) => {
+      const prefix = `r${observationIndex}-${sourceIndex}-`;
+      return `${prefix}${"x".repeat(256 - prefix.length)}`;
+    }),
+  ]);
+  const rawIds = [...new Set(sourceGroups.flat())];
+  const missingId = sourceGroups[0][1];
+  const rawEntries = rawIds.filter((id) => id !== missingId)
+    .map((id) => messageEntry(id, "user", id === targetRawId ? "Exact target source." : "Linked source."));
+  const targetRaw = rawEntries.find(({ id }) => id === targetRawId);
+  assert.ok(targetRaw);
+  const observations = sourceGroups.map((sourceEntryIds, index) => ({
+    type: "custom",
+    id: `observation-shared-target-${index + 1}`,
+    customType: "pi-session-memory.observation",
+    data: { schemaVersion: 1, text: `Observation ${index + 1}: ${"d".repeat(900)}`, sourceEntryIds },
+  }));
+  const reflection = {
+    type: "custom",
+    id: "reflection-shared-target",
+    customType: "pi-session-memory.reflection",
+    data: { schemaVersion: 1, text: "Six observations link the same raw entry.", supportingObservationIds: observations.map(({ id }) => id) },
+  };
+  assert.ok(sourceGroups.flat().every((id) => id.length === 256));
+  const runtime = hydrationTool([...rawEntries, ...observations, reflection]);
+
+  const result = await runtime.tool.execute("call-1", {
+    reflectionId: reflection.id,
+    depth: "raw",
+    entryId: targetRawId,
+  }, undefined, undefined, runtime.context);
+  const text = result.content[0].text;
+  const projection = JSON.parse(text);
+
+  assert.ok(text.length <= 16_000);
+  assert.deepEqual(projection.observations, [], "an over-bound supporting bundle must not block the requested raw entry");
+  assert.deepEqual(projection.rawEntries, [targetRaw]);
+  assert.deepEqual(projection.missingIds, [missingId], "missing links across the full chain remain visible");
+  assert.equal(projection.status, "partial");
+  assert.equal(projection.exactEvidenceRecovered, false);
+  assert.deepEqual(projection.nextDetail, { depth: "raw", entryId: sourceGroups[0][2] });
 });
 
 test("uses the bounded raw-entry pointer to hydrate the next exact entry separately", async () => {

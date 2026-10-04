@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { StringDecoder } from "node:string_decoder";
 import { tmpdir } from "node:os";
@@ -227,12 +228,14 @@ test("real native compaction and same-session resume preserve linked hydration a
   const sessionDir = resolve(tempRoot, "sessions");
   const observerExtension = resolve(tempRoot, "observe-context.mjs");
   const contextEvidenceFile = resolve(tempRoot, "context-evidence.jsonl");
+  const cancelCompactionFile = resolve(tempRoot, "cancel-compaction");
+  const compactionEvidenceFile = resolve(tempRoot, "compaction-evidence.jsonl");
   const workerShim = resolve(tempRoot, "uncertain-worker");
   const workerMarker = resolve(tempRoot, "worker-started.txt");
   await mkdir(resolve(cwd, ".pi"), { recursive: true });
   await mkdir(sessionDir, { recursive: true });
   await writeFile(resolve(cwd, ".pi/settings.json"), JSON.stringify({ compaction: { keepRecentTokens: 0 } }));
-  await writeFile(observerExtension, contextObserverSource(contextEvidenceFile));
+  await writeFile(observerExtension, contextObserverSource(contextEvidenceFile, cancelCompactionFile, compactionEvidenceFile));
   await writeFile(workerShim, `#!/bin/sh\nprintf '%s\\n' started >> "$${workerMarkerVariable}"\nprintf '%s\\n' 'not-a-valid-laya-response'\n`);
   await chmod(workerShim, 0o700);
 
@@ -305,7 +308,8 @@ test("real native compaction and same-session resume preserve linked hydration a
   assert.equal(isRecord(firstCompactions[0]) && firstCompactions[0].fromHook === true, false, "the compaction must be Pi-native, not an extension summary");
   assertBaselineRawEntriesUnchanged(initialRawEntries, afterFirstCompaction);
   const resumedSeed = SessionManager.open(canonicalSessionFile, sessionDir, cwd);
-  const resumedBranchIds = new Set(resumedSeed.getBranch().map(({ id }: { id: string }) => id));
+  const compactedBranchIds = resumedSeed.getBranch().map(({ id }: { id: string }) => id);
+  const resumedBranchIds = new Set(compactedBranchIds);
   for (const id of [rawId, observationId, reflectionId, partialReflectionId]) {
     assert.ok(resumedBranchIds.has(id), "the same active branch must retain each linked synthetic entry after native compaction");
   }
@@ -319,6 +323,11 @@ test("real native compaction and same-session resume preserve linked hydration a
   const resumedSessionFile = await realpath(resolve(cwd, resumedState.data.sessionFile));
   assert.equal(resumedSessionFile, canonicalSessionFile, "resume must open the exact same persisted session file");
   assertContained(resumedSessionFile, sessionRoot, "resumed Pi session must remain inside the fresh disposable directory");
+  const branchAfterResume = SessionManager.open(canonicalSessionFile, sessionDir, cwd).getBranch().map(({ id }: { id: string }) => id);
+  assertSameSessionResume(
+    { sessionId, sessionFile: canonicalSessionFile, branchEntryIds: compactedBranchIds },
+    { sessionId: resumedState.data.sessionId, sessionFile: resumedSessionFile, branchEntryIds: branchAfterResume },
+  );
   assert.equal(rpc.confirmationRequests.length, 0, "resumed memory generation remains disabled unless separately disclosed and enabled");
 
   const resumePromptCursor = rpc.cursor();
@@ -365,6 +374,28 @@ test("real native compaction and same-session resume preserve linked hydration a
   const secondCompaction = await runNativeCompaction(rpc);
   assert.equal(rpc.notificationRequests.length, 1, "native compaction must not repeat the worker warning");
   assert.equal(rpc.confirmationRequests.length, 0, "native compaction must not request memory generation consent");
+
+  const cancellationSetupCursor = rpc.cursor();
+  const cancellationSetup = await rpc.command({
+    type: "prompt",
+    message: "Synthetic compaction test setup: reply exactly 'synthetic cancellation setup complete'. No prior session details are needed.",
+  });
+  assert.equal(cancellationSetup.success, true, "a synthetic post-compaction turn must prepare content for the cancelled compaction case");
+  await rpc.waitForEvent(cancellationSetupCursor, (event) => event.type === "agent_settled");
+  const entriesBeforeCancelledCompaction = await readSession(canonicalSessionFile);
+  await writeFile(cancelCompactionFile, "cancel the next synthetic manual compaction\n");
+  const cancelledResponse = await rpc.command({ type: "compact" });
+  const cancellationEvidence = (await readFile(compactionEvidenceFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as RpcRecord);
+  assert.deepEqual(cancellationEvidence, [
+    { phase: "before", reason: "manual" },
+    { phase: "failed", reason: "manual", aborted: true },
+  ], "real Pi must invoke and report a cancelled native compaction");
+  const responseHasSummary = isRecord(cancelledResponse.data) && typeof cancelledResponse.data.summary === "string" && cancelledResponse.data.summary.length > 0;
+  assert.equal(cancelledResponse.success === true && responseHasSummary, false, "cancelled native compaction must not return a successful summary");
+  const entriesAfterCancelledCompaction = await readSession(canonicalSessionFile);
+  assert.deepEqual(entriesAfterCancelledCompaction, entriesBeforeCancelledCompaction, "cancelled native compaction must append no compaction or replacement memory summary");
+  assert.equal(rpc.notificationRequests.length, 1, "cancelled native compaction must not trigger another worker warning");
+  assert.equal(rpc.confirmationRequests.length, 0, "cancelled native compaction must not request memory generation consent");
   const warningNotifications = rpc.notificationRequests.length;
   const generationConsentRequests = rpc.confirmationRequests.length;
   await rpc.stop();
@@ -372,7 +403,7 @@ test("real native compaction and same-session resume preserve linked hydration a
 
   const finalEntries = await readSession(canonicalSessionFile);
   const allCompactions = finalEntries.filter((entry) => isRecord(entry) && entry.type === "compaction");
-  assert.equal(allCompactions.length, 2, "native compaction must remain available after the resumed worker uncertainty");
+  assert.equal(allCompactions.length, 2, "native compaction must remain available after the resumed worker uncertainty and cancellation");
   assert.ok(allCompactions.every((entry) => isRecord(entry) && entry.fromHook !== true), "both compactions must remain Pi-native");
   assertBaselineRawEntriesUnchanged(initialRawEntries, finalEntries);
   assert.deepEqual(
@@ -396,7 +427,62 @@ test("real native compaction and same-session resume preserve linked hydration a
   })}`);
 });
 
-async function runNativeCompaction(rpc: PiRpc): Promise<{ nativeRpcSucceeded: true; aborted: false; summaryCharacters: number }> {
+test("failed or cancelled native compaction cannot satisfy the gate or trigger a replacement operation", async () => {
+  const failed = fakeCompactionRpc(
+    { success: false, error: "Compaction failed" },
+    { type: "compaction_end", aborted: false, result: undefined },
+  );
+  await assert.rejects(runNativeCompaction(failed.rpc), /native Pi RPC compact must succeed/);
+  assert.deepEqual(failed.commands, [{ type: "compact" }], "failure evidence must not be replaced with another summary operation");
+
+  const cancelled = fakeCompactionRpc(
+    { success: true, data: { summary: "not acceptance evidence" } },
+    { type: "compaction_end", aborted: true, result: undefined },
+  );
+  await assert.rejects(runNativeCompaction(cancelled.rpc), /cancelled native compaction must not count as a pass/);
+  assert.deepEqual(cancelled.commands, [{ type: "compact" }], "cancelled native compaction must not be followed by an extension replacement");
+
+  const noResult = fakeCompactionRpc(
+    { success: true, data: { summary: "not acceptance evidence" } },
+    { type: "compaction_end", aborted: false, result: undefined },
+  );
+  await assert.rejects(runNativeCompaction(noResult.rpc), /failed native compaction has no result/);
+  assert.deepEqual(noResult.commands, [{ type: "compact" }], "missing-result evidence must not be replaced with an extension summary");
+});
+
+test("a different session or active branch cannot satisfy same-session resume acceptance", () => {
+  const original = { sessionId: "synthetic-session", sessionFile: "/tmp/original.jsonl", branchEntryIds: ["root", "source", "compaction"] };
+
+  assert.throws(() => assertSameSessionResume(original, {
+    ...original,
+    sessionId: "different-session",
+  }), /resumed Pi session ID must exactly match/);
+  assert.throws(() => assertSameSessionResume(original, {
+    ...original,
+    branchEntryIds: ["root", "other-source", "compaction"],
+  }), /resumed active branch must exactly match/);
+});
+
+function fakeCompactionRpc(response: RpcRecord, event: RpcRecord): { rpc: Pick<PiRpc, "cursor" | "command" | "waitForEvent">; commands: RpcRecord[] } {
+  const commands: RpcRecord[] = [];
+  return {
+    commands,
+    rpc: {
+      cursor: () => 0,
+      command: async (command) => {
+        commands.push(command);
+        return response;
+      },
+      waitForEvent: async (after, predicate) => {
+        assert.equal(after, 0);
+        assert.equal(predicate(event), true);
+        return event;
+      },
+    },
+  };
+}
+
+async function runNativeCompaction(rpc: Pick<PiRpc, "cursor" | "command" | "waitForEvent">): Promise<{ nativeRpcSucceeded: true; aborted: false; summaryCharacters: number }> {
   const cursor = rpc.cursor();
   const response = await rpc.command({ type: "compact" });
   assert.equal(response.success, true, "native Pi RPC compact must succeed; failed or cancelled compaction is not acceptance evidence");
@@ -409,6 +495,12 @@ async function runNativeCompaction(rpc: PiRpc): Promise<{ nativeRpcSucceeded: tr
   assert.equal(typeof compactEvent.result.summary, "string");
   assert.ok(compactEvent.result.summary.length > 0);
   return { nativeRpcSucceeded: true, aborted: false, summaryCharacters: compactEvent.result.summary.length };
+}
+
+function assertSameSessionResume(expected: { sessionId: unknown; sessionFile: unknown; branchEntryIds: unknown }, actual: { sessionId: unknown; sessionFile: unknown; branchEntryIds: unknown }): void {
+  assert.equal(actual.sessionId, expected.sessionId, "resumed Pi session ID must exactly match the pre-compaction identity");
+  assert.equal(actual.sessionFile, expected.sessionFile, "resume must open the exact same persisted session file");
+  assert.deepEqual(actual.branchEntryIds, expected.branchEntryIds, "resumed active branch must exactly match the compacted branch");
 }
 
 function syntheticAssistant(text: string, timestamp: number) {
@@ -424,8 +516,8 @@ function syntheticAssistant(text: string, timestamp: number) {
   };
 }
 
-function contextObserverSource(evidenceFile: string): string {
-  return `import { appendFileSync } from "node:fs";
+function contextObserverSource(evidenceFile: string, cancelCompactionFile: string, compactionEvidenceFile: string): string {
+  return `import { appendFileSync, existsSync } from "node:fs";
 export default function (pi) {
   pi.on("context", (event) => {
     const projectionPresent = event.messages.some((message) => {
@@ -434,6 +526,14 @@ export default function (pi) {
     });
     appendFileSync(${JSON.stringify(evidenceFile)}, JSON.stringify({ projectionPresent }) + "\\n");
     return { messages: event.messages };
+  });
+  pi.on("session_before_compact", (event) => {
+    if (!existsSync(${JSON.stringify(cancelCompactionFile)})) return;
+    appendFileSync(${JSON.stringify(compactionEvidenceFile)}, JSON.stringify({ phase: "before", reason: event.reason }) + "\\n");
+    return { cancel: true };
+  });
+  pi.on("session_compact_failed", (event) => {
+    appendFileSync(${JSON.stringify(compactionEvidenceFile)}, JSON.stringify({ phase: "failed", reason: event.reason, aborted: event.aborted }) + "\\n");
   });
 }
 `;

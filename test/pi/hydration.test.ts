@@ -6,6 +6,7 @@ import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { test } from "node:test";
 import extensionFactory from "../../src/extension.ts";
+import { registerHydration } from "../../src/hydration.ts";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const piExecutable = execFileSync("which", ["pi"], { encoding: "utf8" }).trim();
@@ -23,6 +24,111 @@ function resultData(result: { content: Array<{ text?: string }> }) {
   assert.equal(typeof result.content[0]?.text, "string");
   return JSON.parse(result.content[0].text!);
 }
+
+test("a controlled Pi model response does not execute hydration when resident reflection is sufficient", async (t) => {
+  const tempDir = await mkdtemp(resolve(tmpdir(), "pi-session-memory-no-hydration-"));
+  let session;
+  t.after(async () => {
+    session?.dispose();
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  const [{ createAgentSession }, { DefaultResourceLoader }, { ModelRuntime }, { SessionManager }, { AssistantMessageEventStream }] = await Promise.all([
+    importPi("dist/core/sdk.js"),
+    importPi("dist/core/resource-loader.js"),
+    importPi("dist/core/model-runtime.js"),
+    importPi("dist/core/session-manager.js"),
+    importPi("node_modules/@earendil-works/pi-ai/dist/utils/event-stream.js"),
+  ]);
+  const sessionManager = SessionManager.inMemory();
+  const rawId = sessionManager.appendMessage(messageEntry("user", "Synthetic source: the quartz key is cobalt."));
+  const observationId = sessionManager.appendCustomEntry("pi-session-memory.observation", {
+    schemaVersion: 1,
+    text: "The synthetic source identifies the quartz key.",
+    sourceEntryIds: [rawId],
+  });
+  const reflectionText = "The quartz key is cobalt.";
+  sessionManager.appendCustomEntry("pi-session-memory.reflection", {
+    schemaVersion: 1,
+    text: reflectionText,
+    supportingObservationIds: [observationId],
+  });
+  const originalMemoryEntries = structuredClone(sessionManager.getBranch().filter((entry) => entry.type === "custom"));
+  const runtime = await ModelRuntime.create({
+    authPath: resolve(tempDir, "synthetic-auth.json"),
+    modelsPath: null,
+    refreshOnCreate: false,
+  });
+  const model = runtime.getModel("openai", "gpt-4o");
+  assert.ok(model, "Pi 0.87.1 must provide the deterministic test model metadata");
+  runtime.hasConfiguredAuth = () => true;
+
+  const answer = "cobalt";
+  const finalMessage = {
+    role: "assistant",
+    content: [{ type: "text", text: answer }],
+    api: model.api,
+    provider: model.provider,
+    model: model.id,
+    usage: { input: 0, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 1 },
+    stopReason: "stop",
+    timestamp: Date.now(),
+  };
+  let modelRequests = 0;
+  let modelContext;
+  runtime.streamSimple = (_model, context) => {
+    modelRequests += 1;
+    modelContext = context;
+    const stream = new AssistantMessageEventStream();
+    const emptyPartial = { ...finalMessage, content: [] };
+    queueMicrotask(() => {
+      stream.push({ type: "start", partial: emptyPartial });
+      stream.push({ type: "text_start", contentIndex: 0, partial: emptyPartial });
+      stream.push({ type: "text_delta", contentIndex: 0, delta: answer, partial: finalMessage });
+      stream.push({ type: "text_end", contentIndex: 0, content: answer, partial: finalMessage });
+      stream.push({ type: "done", reason: "stop", message: finalMessage });
+    });
+    return stream;
+  };
+
+  const resourceLoader = new DefaultResourceLoader({
+    cwd: projectRoot,
+    agentDir: tempDir,
+    noSkills: true,
+    noPromptTemplates: true,
+    noThemes: true,
+    noContextFiles: true,
+    appendSystemPrompt: [`Resident reflection (synthetic): ${reflectionText}`],
+    extensionFactories: [(pi) => registerHydration(pi)],
+  });
+  await resourceLoader.reload();
+  const created = await createAgentSession({
+    cwd: projectRoot,
+    agentDir: tempDir,
+    modelRuntime: runtime,
+    model,
+    resourceLoader,
+    sessionManager,
+    tools: ["hydrate_session_memory"],
+    thinkingLevel: "off",
+  });
+  session = created.session;
+  assert.deepEqual(session.getActiveToolNames(), ["hydrate_session_memory"], "the no-call model turn must have hydration available");
+
+  const hydrationCalls = [];
+  session.subscribe((event) => {
+    if (event.type === "tool_execution_start" && event.toolName === "hydrate_session_memory") hydrationCalls.push(event.toolCallId);
+  });
+  await session.prompt("What color is the quartz key? The resident reflection has all the detail needed.");
+
+  assert.equal(modelRequests, 1, "Pi must send the no-call turn to the controlled model");
+  assert.match(JSON.stringify(modelContext.messages), /The quartz key is cobalt/, "the model context must contain the sufficient resident reflection");
+  assert.ok(modelContext.messages.some((message) => message.role === "system" && message.toolsAdded?.some((tool) => tool.name === "hydrate_session_memory")), "the controlled response must have access to the hydration tool");
+  assert.equal(session.getLastAssistantText(), answer);
+  assert.deepEqual(hydrationCalls, [], "a no-tool-call model response must not execute hydration");
+  assert.deepEqual(sessionManager.getBranch().filter((entry) => entry.type === "custom"), originalMemoryEntries, "the no-call turn must not append or rewrite semantic session entries");
+  assert.equal(session.messages.some((message) => message.role === "toolResult" || (message.role === "assistant" && message.content.some((part) => part.type === "toolCall"))), false, "the no-call turn must return no hydration content");
+});
 
 test("Pi's registered model-callable hydration tool resolves only the active branch to exact raw entries", async (t) => {
   const sessionDir = await mkdtemp(resolve(tmpdir(), "pi-session-memory-hydration-"));
