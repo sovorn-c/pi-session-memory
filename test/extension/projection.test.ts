@@ -4,6 +4,7 @@ import { registerFormation } from "../../src/extension.ts";
 
 const observationType = "pi-session-memory.observation";
 const reflectionType = "pi-session-memory.reflection";
+const supersessionType = "pi-session-memory.supersession";
 
 function messageEntry(id, role, text) {
   return {
@@ -19,10 +20,12 @@ function observation(id, text, sourceEntryIds) {
   return { type: "custom", id, customType: observationType, data: { schemaVersion: 1, text, sourceEntryIds } };
 }
 
-function projectionRuntime({ branch = [], select, candidateLimit = "6", outputLimit = "4000" } = {}) {
+function projectionRuntime({ branch = [], select, resident, candidateLimit = "6", outputLimit = "4000" } = {}) {
   const handlers = new Map();
   const flags = new Map();
   const requests = [];
+  let activeBranch = branch;
+  let sessionId = "projection-session";
   const pi = {
     registerFlag(name, options) { if (!flags.has(name)) flags.set(name, options.default); },
     getFlag(name) { return flags.get(name); },
@@ -30,12 +33,12 @@ function projectionRuntime({ branch = [], select, candidateLimit = "6", outputLi
     registerTool() {},
     appendEntry() { throw new Error("projection must not append durable entries"); },
   };
-  const ctx = { sessionManager: { getSessionId: () => "projection-session", getBranch: () => branch } };
+  const ctx = { sessionManager: { getSessionId: () => sessionId, getBranch: () => activeBranch } };
   const evaluateGate = async (request) => {
     requests.push(request);
-    if (request.gate === "resident") return { accepted: true, p_true: 0.99, confidence: 0.99 };
+    if (request.gate === "resident") return resident ? resident(request) : { accepted: true, p_true: 0.99, confidence: 0.99 };
     const candidates = JSON.parse(request.state).candidates;
-    const selectedEntryId = select ? select(request, candidates) : candidates[0]?.entryId;
+    const selectedEntryId = select ? await select(request, candidates) : candidates[0]?.entryId;
     return { selected_entry_id: selectedEntryId ?? null };
   };
   registerFormation(pi, { evaluateGate });
@@ -45,6 +48,8 @@ function projectionRuntime({ branch = [], select, candidateLimit = "6", outputLi
     ctx,
     requests,
     handlers,
+    setBranch(next) { activeBranch = next; },
+    setSessionId(next) { sessionId = next; },
     async context(text, previous = []) {
       const messages = [
         ...previous,
@@ -140,12 +145,93 @@ test("an observation with a missing active-branch source link is never a candida
   assert.deepEqual(runtime.requests, []);
 });
 
+test("resume reconstructs superseded and stale memory status without projecting old understanding", async () => {
+  const rawOld = messageEntry("raw-old", "user", "The earlier synthetic policy was enabled.");
+  const oldObservation = observation("observation-old", "The old synthetic policy is enabled.", [rawOld.id]);
+  const staleReflection = {
+    type: "custom",
+    id: "reflection-on-old-policy",
+    customType: reflectionType,
+    data: { schemaVersion: 1, text: "The old policy remains the current choice.", supportingObservationIds: [oldObservation.id] },
+  };
+  const rawNew = messageEntry("raw-new", "user", "New exact synthetic evidence replaces the prior policy.");
+  const newObservation = observation("observation-new", "The prior synthetic policy has been replaced.", [rawNew.id]);
+  const record = {
+    type: "custom",
+    id: "supersession-old",
+    customType: supersessionType,
+    data: {
+      schemaVersion: 1,
+      status: "superseded",
+      supersededEntryId: oldObservation.id,
+      replacementEntryId: newObservation.id,
+      decision: { accepted: true, p_true: 0.95, confidence: 0.9 },
+    },
+  };
+  const branch = [rawOld, oldObservation, staleReflection, rawNew, newObservation, record];
+  const runtime = projectionRuntime({ branch, select: (_request, candidates) => candidates[0]?.entryId });
+  const result = await runtime.context("What did we decide earlier about the synthetic policy?");
+
+  assert.deepEqual(JSON.parse(runtime.requests[0].state).candidates.map(({ entryId }) => entryId), [newObservation.id]);
+  assert.equal(JSON.stringify(result).includes(oldObservation.data.text), false);
+  assert.equal(JSON.stringify(result).includes(staleReflection.data.text), false);
+  assert.match(result.at(-2).content[0].text, /The prior synthetic policy has been replaced/);
+  assert.deepEqual(branch, [rawOld, oldObservation, staleReflection, rawNew, newObservation, record], "resume must reconstruct status without deleting canonical history");
+});
+
+test("a supersession record with a missing replacement withholds only its affected memory", async () => {
+  const rawOld = messageEntry("raw-invalid-old", "user", "The affected synthetic policy used the old value.");
+  const oldObservation = observation("observation-invalid-old", "The affected synthetic policy uses the old value.", [rawOld.id]);
+  const rawCurrent = messageEntry("raw-valid-current", "user", "An unrelated current synthetic detail.");
+  const currentObservation = observation("observation-valid-current", "An unrelated current synthetic detail remains valid.", [rawCurrent.id]);
+  const invalidRecord = {
+    type: "custom",
+    id: "supersession-missing-replacement",
+    customType: supersessionType,
+    data: {
+      schemaVersion: 1,
+      status: "superseded",
+      supersededEntryId: oldObservation.id,
+      replacementEntryId: "observation-replacement-missing",
+      decision: { accepted: true, p_true: 0.95, confidence: 0.9 },
+    },
+  };
+  const runtime = projectionRuntime({ branch: [rawOld, oldObservation, rawCurrent, currentObservation, invalidRecord] });
+  await runtime.context("What did we decide earlier about the synthetic detail?");
+
+  assert.deepEqual(JSON.parse(runtime.requests[0].state).candidates.map(({ entryId }) => entryId), [currentObservation.id]);
+});
+
+test("an unresolved supersession record makes neither linked memory current", async () => {
+  const rawOld = messageEntry("raw-unresolved-old", "user", "The prior synthetic value was true.");
+  const oldObservation = observation("observation-unresolved-old", "The prior synthetic value is true.", [rawOld.id]);
+  const rawNew = messageEntry("raw-unresolved-new", "user", "Potential evidence about the synthetic value.");
+  const newObservation = observation("observation-unresolved-new", "Potential evidence changes the synthetic value.", [rawNew.id]);
+  const rawCurrent = messageEntry("raw-unresolved-current", "user", "An unrelated current synthetic detail.");
+  const currentObservation = observation("observation-unresolved-current", "An unrelated current synthetic detail remains valid.", [rawCurrent.id]);
+  const record = {
+    type: "custom",
+    id: "supersession-unresolved",
+    customType: supersessionType,
+    data: {
+      schemaVersion: 1,
+      status: "unresolved",
+      supersededEntryId: oldObservation.id,
+      replacementEntryId: newObservation.id,
+    },
+  };
+  const runtime = projectionRuntime({ branch: [rawOld, oldObservation, rawNew, newObservation, rawCurrent, currentObservation, record] });
+  await runtime.context("What did we decide earlier about the synthetic value?");
+
+  assert.deepEqual(JSON.parse(runtime.requests[0].state).candidates.map(({ entryId }) => entryId), [currentObservation.id]);
+});
+
 test("an empty active-branch candidate set stays native without inventing memory", async () => {
   const runtime = projectionRuntime();
-  const result = await runtime.context("What did we decide earlier about the prior design?");
+  const messages = [{ role: "user", content: [{ type: "text", text: "What did we decide earlier about the prior design?" }], timestamp: 1 }];
+  const result = await runtime.handlers.get("context")({ type: "context", messages }, runtime.ctx);
 
-  assert.equal(result.length, 1);
-  assert.equal(result[0].role, "user");
+  assert.deepEqual(result, { messages });
   assert.deepEqual(runtime.requests, []);
 });
 
@@ -161,9 +247,24 @@ test("a validated resident projection is reused for a sufficient request without
   assert.match(first.at(-2).content[0].text, /Keep append-only provenance/);
   assert.match(second.at(-2).content[0].text, /Keep append-only provenance/);
   assert.deepEqual(runtime.requests.map(({ gate }) => gate), ["projection", "resident"]);
+  assert.deepEqual(JSON.parse(runtime.requests[1].state).candidate, {
+    entryId: expectedId,
+    kind: "observation",
+    text: branch.find(({ id }) => id === expectedId).data.text,
+  });
 });
 
-test("an unselected or invalid selection never creates a partial projection", async () => {
+test("an empty selection stays native and never creates a partial projection", async () => {
+  const { branch } = linkedMemory(2);
+  const runtime = projectionRuntime({ branch, select: () => null });
+  const messages = [{ role: "user", content: [{ type: "text", text: "What did we decide earlier about append-only branch provenance?" }], timestamp: 1 }];
+  const result = await runtime.handlers.get("context")({ type: "context", messages }, runtime.ctx);
+
+  assert.deepEqual(result, { messages });
+  assert.deepEqual(runtime.requests.map(({ gate }) => gate), ["projection"]);
+});
+
+test("an invalid selection never creates a partial projection", async () => {
   const { branch } = linkedMemory(2);
   const runtime = projectionRuntime({ branch, select: () => "not-an-active-candidate" });
   const result = await runtime.context("What did we decide earlier about append-only branch provenance?");
@@ -172,15 +273,151 @@ test("an unselected or invalid selection never creates a partial projection", as
   assert.equal(result[0].role, "user");
 });
 
-test("a selection whose candidate leaves the active branch before projection is discarded", async () => {
-  const branch = linkedMemory(1).branch;
-  const runtime = projectionRuntime({ branch });
-  let reads = 0;
-  runtime.ctx.sessionManager.getBranch = () => { reads += 1; return reads === 1 ? branch : []; };
-  const result = await runtime.context("What did we decide earlier about append-only provenance?");
+test("a cached resident whose active-branch source disappears is not reused", async () => {
+  const { branch, expectedId } = linkedMemory(1);
+  const runtime = projectionRuntime({ branch, select: (_request, candidates) => candidates.find(({ entryId }) => entryId === expectedId)?.entryId });
+  const first = await runtime.context("What did we decide earlier about append-only provenance?");
+  runtime.setBranch([]);
+  const messages = [{ role: "user", content: [{ type: "text", text: "What did we decide earlier about append-only provenance?" }], timestamp: 2 }];
+  const second = await runtime.handlers.get("context")({ type: "context", messages }, runtime.ctx);
 
-  assert.equal(result.length, 1);
-  assert.equal(runtime.requests[0].gate, "projection");
+  assert.match(first.at(-2).content[0].text, /Keep append-only provenance/);
+  assert.deepEqual(second, { messages });
+  assert.deepEqual(runtime.requests.map(({ gate }) => gate), ["projection"]);
+});
+
+test("a resident invalidated while its sufficiency gate is pending leaves native context unchanged", async () => {
+  const { branch, expectedId } = linkedMemory(1);
+  let residentStarted;
+  const started = new Promise((resolveStarted) => { residentStarted = resolveStarted; });
+  let releaseResident;
+  const residentPending = new Promise((resolveResident) => { releaseResident = resolveResident; });
+  const runtime = projectionRuntime({
+    branch,
+    select: (_request, candidates) => candidates.find(({ entryId }) => entryId === expectedId)?.entryId,
+    resident: async () => {
+      residentStarted();
+      await residentPending;
+      return { accepted: true, p_true: 0.99, confidence: 0.99 };
+    },
+  });
+  await runtime.context("What did we decide earlier about append-only provenance?");
+  const messages = [{ role: "user", content: [{ type: "text", text: "What did we decide earlier about append-only provenance?" }], timestamp: 2 }];
+  const pending = runtime.handlers.get("context")({ type: "context", messages }, runtime.ctx);
+  await started;
+  const rawNew = messageEntry("raw-resident-replacement", "user", "New evidence replaces the prior append-only policy.");
+  const newObservation = observation("observation-resident-replacement", "The prior append-only policy has been replaced.", [rawNew.id]);
+  runtime.setBranch([
+    ...branch,
+    rawNew,
+    newObservation,
+    {
+      type: "custom",
+      id: "supersession-resident-old",
+      customType: supersessionType,
+      data: {
+        schemaVersion: 1,
+        status: "superseded",
+        supersededEntryId: expectedId,
+        replacementEntryId: newObservation.id,
+        decision: { accepted: true, p_true: 0.95, confidence: 0.9 },
+      },
+    },
+  ]);
+  releaseResident();
+
+  assert.deepEqual(await pending, { messages });
+  assert.deepEqual(runtime.requests.map(({ gate }) => gate), ["projection", "resident"]);
+});
+
+test("a rejected resident gate does not select from the branch snapshot if its support changes", async () => {
+  const { branch, expectedId } = linkedMemory(1);
+  let residentStarted;
+  const started = new Promise((resolveStarted) => { residentStarted = resolveStarted; });
+  let releaseResident;
+  const residentPending = new Promise((resolveResident) => { releaseResident = resolveResident; });
+  const runtime = projectionRuntime({
+    branch,
+    select: (_request, candidates) => candidates.find(({ entryId }) => entryId === expectedId)?.entryId,
+    resident: async () => {
+      residentStarted();
+      await residentPending;
+      return { accepted: false, p_true: 0.01, confidence: 0.99 };
+    },
+  });
+  await runtime.context("What did we decide earlier about append-only provenance?");
+  const messages = [{ role: "user", content: [{ type: "text", text: "What did we decide earlier about append-only provenance?" }], timestamp: 2 }];
+  const pending = runtime.handlers.get("context")({ type: "context", messages }, runtime.ctx);
+  await started;
+  const rawNew = messageEntry("raw-rejected-resident-replacement", "user", "New evidence replaces the prior append-only policy.");
+  const newObservation = observation("observation-rejected-resident-replacement", "The prior append-only policy has been replaced.", [rawNew.id]);
+  runtime.setBranch([
+    ...branch,
+    rawNew,
+    newObservation,
+    {
+      type: "custom",
+      id: "supersession-rejected-resident-old",
+      customType: supersessionType,
+      data: {
+        schemaVersion: 1,
+        status: "superseded",
+        supersededEntryId: expectedId,
+        replacementEntryId: newObservation.id,
+        decision: { accepted: true, p_true: 0.95, confidence: 0.9 },
+      },
+    },
+  ]);
+  releaseResident();
+
+  assert.deepEqual(await pending, { messages });
+  assert.deepEqual(runtime.requests.map(({ gate }) => gate), ["projection", "resident"]);
+});
+
+test("a selection whose branch changes while its gate is pending is discarded", async () => {
+  const { branch, expectedId } = linkedMemory(1);
+  let selectionStarted;
+  const started = new Promise((resolveStarted) => { selectionStarted = resolveStarted; });
+  let releaseSelection;
+  const selectionPending = new Promise((resolveSelection) => { releaseSelection = resolveSelection; });
+  const runtime = projectionRuntime({
+    branch,
+    select: async (_request, candidates) => {
+      selectionStarted();
+      await selectionPending;
+      return candidates.find(({ entryId }) => entryId === expectedId)?.entryId;
+    },
+  });
+  const messages = [{ role: "user", content: [{ type: "text", text: "What did we decide earlier about append-only provenance?" }], timestamp: 1 }];
+  const pending = runtime.handlers.get("context")({ type: "context", messages }, runtime.ctx);
+  await started;
+  runtime.setBranch([]);
+  releaseSelection();
+
+  assert.deepEqual(await pending, { messages });
+});
+
+test("a selection completed after the session changes is not projected into the new session", async () => {
+  const { branch, expectedId } = linkedMemory(1);
+  let selectionStarted;
+  const started = new Promise((resolveStarted) => { selectionStarted = resolveStarted; });
+  let releaseSelection;
+  const selectionPending = new Promise((resolveSelection) => { releaseSelection = resolveSelection; });
+  const runtime = projectionRuntime({
+    branch,
+    select: async (_request, candidates) => {
+      selectionStarted();
+      await selectionPending;
+      return candidates.find(({ entryId }) => entryId === expectedId)?.entryId;
+    },
+  });
+  const messages = [{ role: "user", content: [{ type: "text", text: "What did we decide earlier about append-only provenance?" }], timestamp: 1 }];
+  const pending = runtime.handlers.get("context")({ type: "context", messages }, runtime.ctx);
+  await started;
+  runtime.setSessionId("next-session");
+  releaseSelection();
+
+  assert.deepEqual(await pending, { messages });
 });
 
 test("an over-bound rendered projection is omitted instead of truncating or exposing session history", async () => {

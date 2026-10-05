@@ -30,6 +30,10 @@ Question = dict[str, str | dict[str, str]]
 MAX_PROJECTION_CANDIDATES = 8
 MAX_PROJECTION_NEED_CHARS = 800
 MAX_CANDIDATE_TEXT_CHARS = 500
+MAX_MEMORY_TEXT_CHARS = 1_000
+MAX_SUPERSESSION_SOURCES = 12
+MAX_ENTRY_ID_CHARS = 256
+MAX_SUPERSESSION_SOURCE_TEXT_CHARS = 5_000
 NO_CANDIDATE = "none"
 QUESTIONS: dict[Gate, Question] = {
     "observation": {
@@ -65,6 +69,18 @@ QUESTIONS: dict[Gate, Question] = {
         "criteria": {
             "true": "The resident source-linked memory directly covers the current need.",
             "false": "The resident memory is insufficient or unrelated to the current need.",
+        },
+    },
+    "supersession": {
+        "type": "noul",
+        "instructions": (
+            "Does the exact linked newer session evidence explicitly establish that the old memory has been "
+            "reversed, corrected, or replaced? Do not treat recency, unrelated facts, an additive detail, or "
+            "uncertainty as supersession; the newer evidence must actually supersede the old claim."
+        ),
+        "criteria": {
+            "true": "The exact linked newer evidence explicitly contradicts or replaces the old memory; supersession is established.",
+            "false": "Supersession is not established: evidence is later only, unrelated, additive, ambiguous, or insufficient.",
         },
     },
 }
@@ -175,6 +191,64 @@ def _projection_state(state: str) -> tuple[str, list[tuple[str, str, str]]]:
     return need, parsed
 
 
+def _supersession_state(state: str) -> None:
+    if len(state.encode("utf-8")) > 8_192:
+        raise ValueError("supersession state exceeds its byte bound")
+    try:
+        value: object = json.loads(state)
+    except json.JSONDecodeError:
+        raise ValueError("supersession state is invalid JSON") from None
+    if not isinstance(value, dict) or set(value) != {"oldMemory", "newEvidence"}:
+        raise ValueError("supersession state fields are invalid")
+    old_memory = value["oldMemory"]
+    evidence = value["newEvidence"]
+    if not isinstance(old_memory, dict) or set(old_memory) != {"entryId", "kind", "text"}:
+        raise ValueError("supersession old memory fields are invalid")
+    if (
+        not _valid_entry_id(old_memory["entryId"])
+        or old_memory["kind"] not in ("observation", "reflection")
+        or not _valid_memory_text(old_memory["text"])
+    ):
+        raise ValueError("supersession old memory is invalid")
+    if not isinstance(evidence, dict) or set(evidence) != {"entryId", "text", "sourceEntryIds", "sources"}:
+        raise ValueError("supersession newer evidence fields are invalid")
+    source_ids = evidence["sourceEntryIds"]
+    sources = evidence["sources"]
+    if (
+        not _valid_entry_id(evidence["entryId"])
+        or evidence["entryId"] == old_memory["entryId"]
+        or not _valid_memory_text(evidence["text"])
+        or not isinstance(source_ids, list)
+        or not source_ids
+        or len(source_ids) > MAX_SUPERSESSION_SOURCES
+        or not all(_valid_entry_id(entry_id) for entry_id in source_ids)
+        or len(set(source_ids)) != len(source_ids)
+        or evidence["entryId"] in source_ids
+        or old_memory["entryId"] in source_ids
+        or not isinstance(sources, list)
+        or len(sources) != len(source_ids)
+    ):
+        raise ValueError("supersession newer evidence is invalid")
+    for expected_id, source in zip(source_ids, sources, strict=True):
+        if (
+            not isinstance(source, dict)
+            or set(source) != {"entryId", "role", "text"}
+            or source["entryId"] != expected_id
+            or source["role"] not in ("user", "assistant", "toolResult")
+            or not isinstance(source["text"], str)
+            or len(source["text"]) > MAX_SUPERSESSION_SOURCE_TEXT_CHARS
+        ):
+            raise ValueError("supersession source link is invalid")
+
+
+def _valid_entry_id(value: object) -> bool:
+    return isinstance(value, str) and 0 < len(value) <= MAX_ENTRY_ID_CHARS
+
+
+def _valid_memory_text(value: object) -> bool:
+    return isinstance(value, str) and 0 < len(value) <= MAX_MEMORY_TEXT_CHARS
+
+
 class LayaEvaluator:
     def __init__(self) -> None:
         from laya.agent import Agent
@@ -210,6 +284,8 @@ class LayaEvaluator:
     def evaluate(self, request: GateRequest) -> GateDecision | ProjectionDecision:
         if request.gate == "projection":
             return self._select_projection(request)
+        if request.gate == "supersession":
+            _supersession_state(request.state)
         result = self.agent.system_one(
             {"gate": request.gate, "evidence": request.state},
             {"warranted": QUESTIONS[request.gate]},

@@ -7,7 +7,7 @@ import re
 from typing import BinaryIO, Callable, Literal, TextIO, TypeAlias
 
 
-Gate: TypeAlias = Literal["observation", "reflection", "resident", "projection"]
+Gate: TypeAlias = Literal["observation", "reflection", "resident", "projection", "supersession"]
 ErrorCode: TypeAlias = Literal["invalid_json", "invalid_request", "request_too_large", "laya_error"]
 PROTOCOL_VERSION = 1
 MAX_REQUEST_BYTES = 16_384
@@ -66,6 +66,8 @@ def parse_request(line: bytes) -> GateRequest:
         typed_gate = "resident"
     elif gate == "projection":
         typed_gate = "projection"
+    elif gate == "supersession":
+        typed_gate = "supersession"
     else:
         raise ProtocolError("invalid_request")
     state = payload["state"]

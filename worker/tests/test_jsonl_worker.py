@@ -1,3 +1,4 @@
+import io
 import json
 import math
 import os
@@ -6,8 +7,82 @@ import subprocess
 import sys
 import unittest
 
+from worker.laya_runtime import LayaEvaluator
+from worker.protocol import GateRequest, parse_request, serve
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+class SupersessionGateTests(unittest.TestCase):
+    def setUp(self):
+        self.state = {
+            "oldMemory": {"entryId": "observation-old", "kind": "observation", "text": "The old policy is enabled."},
+            "newEvidence": {
+                "entryId": "observation-new",
+                "text": "The prior policy has been replaced.",
+                "sourceEntryIds": ["raw-new"],
+                "sources": [{"entryId": "raw-new", "role": "user", "text": "New exact evidence."}],
+            },
+        }
+        self.state_text = json.dumps(self.state)
+
+    def test_jsonl_protocol_routes_bounded_supersession_decision(self):
+        captured = {}
+
+        class FakeAgent:
+            def system_one(self, evidence, decisions):
+                captured["evidence"] = evidence
+                captured["decisions"] = decisions
+                return {"answers": {"warranted": {"type": "noul", "noul": 0.95, "confidence": 0.9}}}
+
+        evaluator = object.__new__(LayaEvaluator)
+        evaluator.agent = FakeAgent()
+        request = {
+            "protocol_version": 1,
+            "request_id": "supersession-1",
+            "gate": "supersession",
+            "state": self.state_text,
+        }
+        output = io.BytesIO()
+        serve(io.BytesIO(json.dumps(request).encode() + b"\n"), output, io.StringIO(), evaluator.evaluate)
+        response = json.loads(output.getvalue())
+
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(response["gate"], "supersession")
+        self.assertEqual(response["decision"], {"accepted": True, "p_true": 0.95, "confidence": 0.9})
+        self.assertEqual(captured["evidence"], {"gate": "supersession", "evidence": self.state_text})
+        question = captured["decisions"]["warranted"]
+        self.assertIn("supersede", question["instructions"])
+        self.assertIn("Do not treat recency", question["instructions"])
+        self.assertIn("explicitly contradicts or replaces", question["criteria"]["true"])
+        self.assertIn("not established", question["criteria"]["false"])
+
+    def test_supersession_gate_rejects_invalid_links_before_calling_laya(self):
+        class FakeAgent:
+            def system_one(self, *_args):
+                raise AssertionError("invalid bounded evidence must not reach Laya")
+
+        evaluator = object.__new__(LayaEvaluator)
+        evaluator.agent = FakeAgent()
+        request = GateRequest("supersession-invalid", "supersession", json.dumps({
+            **self.state,
+            "newEvidence": {**self.state["newEvidence"], "sourceEntryIds": ["raw-other"]},
+        }))
+
+        with self.assertRaisesRegex(ValueError, "supersession"):
+            evaluator.evaluate(request)
+
+    def test_protocol_parser_accepts_supersession_requests(self):
+        request = parse_request(json.dumps({
+            "protocol_version": 1,
+            "request_id": "supersession-parse",
+            "gate": "supersession",
+            "state": self.state_text,
+        }).encode())
+
+        self.assertEqual(request.gate, "supersession")
+        self.assertEqual(request.state, self.state_text)
 
 
 class JsonlWorkerIntegrationTests(unittest.TestCase):

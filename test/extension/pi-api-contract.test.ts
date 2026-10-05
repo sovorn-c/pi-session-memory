@@ -23,7 +23,7 @@ test("installed Pi exposes the e01 extension API contract", async () => {
   const extensionDocs = readFileSync(piFile("docs/extensions.md"), "utf8");
   const sessionDocs = readFileSync(piFile("docs/session-format.md"), "utf8");
 
-  assert.equal(packageMetadata.version, "0.87.1");
+  assert.equal(packageMetadata.version, "1.0.2");
   assert.match(extensionTypes, /export interface TurnEndEvent extends BoundaryState \{\s*type: "turn_end";[\s\S]*?messageEntryId: string;\s*toolResultEntryIds: string\[\];/);
   assert.match(extensionTypes, /export interface ContextEvent \{[\s\S]*?messages: AgentMessage\[\];\s*\}/);
   assert.match(extensionTypes, /registerTool<TParams extends TSchema = TSchema, TDetails = unknown, TState = any>\(tool: ToolDefinition<TParams, TDetails, TState>\): void;/);

@@ -1,4 +1,5 @@
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
+import { supersessionStatuses, type MemoryStatus } from "./supersession.ts";
 
 const OBSERVATION_TYPE = "pi-session-memory.observation";
 const REFLECTION_TYPE = "pi-session-memory.reflection";
@@ -43,6 +44,8 @@ interface HydrationProjection {
   unavailableDetails?: Array<{ depth: "raw"; entryId: string; reason: "result_exceeds_output_bound" }>;
   exactEvidenceRecovered: boolean;
   nextDetail: HydrationPointer | null;
+  memoryStatus?: "current" | "superseded" | "stale" | "unresolved";
+  supersededBy?: { entryId: string; replacementEntryId: string };
 }
 interface HydrationParamsValue {
   reflectionId: string;
@@ -102,8 +105,18 @@ function hydrate(branch: SessionEntry[], params: HydrationParamsValue): Hydratio
       nextDetail: null,
     };
   }
-  if (!isReflectionData(foundReflection.data)) throw new Error("Reflection entry has an unsupported or invalid schema");
+  if (!isReflectionData(foundReflection.data)) {
+    return {
+      status: "partial",
+      depth: params.depth,
+      missingIds: [foundReflection.id],
+      exactEvidenceRecovered: false,
+      nextDetail: null,
+      memoryStatus: "unresolved",
+    };
+  }
 
+  const memoryStatus: MemoryStatus = supersessionStatuses(branch).get(foundReflection.id) ?? { status: "unresolved" };
   const projection: HydrationProjection = {
     status: "complete",
     depth: params.depth,
@@ -115,6 +128,10 @@ function hydrate(branch: SessionEntry[], params: HydrationParamsValue): Hydratio
     missingIds: [],
     exactEvidenceRecovered: false,
     nextDetail: params.depth === "reflection" ? { depth: "observation" } : null,
+    memoryStatus: memoryStatus.status,
+    ...(memoryStatus.status === "superseded"
+      ? { supersededBy: { entryId: memoryStatus.recordEntryId, replacementEntryId: memoryStatus.replacementEntryId } }
+      : {}),
   };
   if (params.depth === "reflection") return projection;
 
@@ -126,7 +143,10 @@ function hydrate(branch: SessionEntry[], params: HydrationParamsValue): Hydratio
       projection.missingIds.push(id);
       continue;
     }
-    if (!isObservationData(entry.data)) throw new Error("Observation entry has an unsupported or invalid schema");
+    if (!isObservationData(entry.data)) {
+      projection.missingIds.push(id);
+      continue;
+    }
     observationsById.set(id, entry.data);
   }
   const requestedRawId = params.depth === "raw" ? params.entryId : undefined;

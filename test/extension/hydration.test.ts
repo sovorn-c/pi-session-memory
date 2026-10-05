@@ -57,6 +57,53 @@ function messageEntry(id, role, text) {
   };
 }
 
+test("hydrates superseded reflection history with its exact evidence and status", async () => {
+  const rawOld = messageEntry("raw-hydrate-old", "user", "Exact historical evidence for the old synthetic policy.");
+  const oldObservation = {
+    type: "custom",
+    id: "observation-hydrate-old",
+    customType: "pi-session-memory.observation",
+    data: { schemaVersion: 1, text: "The old synthetic policy is enabled.", sourceEntryIds: [rawOld.id] },
+  };
+  const oldReflection = {
+    type: "custom",
+    id: "reflection-hydrate-old",
+    customType: "pi-session-memory.reflection",
+    data: { schemaVersion: 1, text: "The old synthetic policy remains current.", supportingObservationIds: [oldObservation.id] },
+  };
+  const rawNew = messageEntry("raw-hydrate-new", "user", "New exact synthetic evidence replaces the policy.");
+  const newObservation = {
+    type: "custom",
+    id: "observation-hydrate-new",
+    customType: "pi-session-memory.observation",
+    data: { schemaVersion: 1, text: "The old policy has been replaced.", sourceEntryIds: [rawNew.id] },
+  };
+  const record = {
+    type: "custom",
+    id: "supersession-hydrate-old",
+    customType: "pi-session-memory.supersession",
+    data: {
+      schemaVersion: 1,
+      status: "superseded",
+      supersededEntryId: oldReflection.id,
+      replacementEntryId: newObservation.id,
+      decision: { accepted: true, p_true: 0.95, confidence: 0.9 },
+    },
+  };
+  const runtime = hydrationTool([rawOld, oldObservation, oldReflection, rawNew, newObservation, record]);
+
+  const result = resultData(await runtime.tool.execute("call-1", {
+    reflectionId: oldReflection.id,
+    depth: "raw",
+  }, undefined, undefined, runtime.context));
+
+  assert.equal(result.memoryStatus, "superseded");
+  assert.deepEqual(result.supersededBy, { entryId: record.id, replacementEntryId: newObservation.id });
+  assert.equal(result.reflection.entryId, oldReflection.id);
+  assert.deepEqual(result.rawEntries, [rawOld], "supersession withholds projection without deleting exact historical support");
+  assert.equal(result.exactEvidenceRecovered, true);
+});
+
 test("hydrates only the requested reflection, observation, or exact raw evidence depth", async () => {
   const raw = messageEntry("raw-1", "user", "The session is canonical; retain exact source entry IDs.");
   const observation = {
@@ -131,6 +178,50 @@ test("reports missing observation and raw links as partial without claiming exac
   assert.deepEqual(missingRawResult.missingIds, ["raw-absent"]);
   assert.equal(missingRawResult.exactEvidenceRecovered, false);
   assert.deepEqual(missingRawResult.rawEntries, []);
+});
+
+test("malformed reflection or observation support stays unresolved without substituting evidence", async () => {
+  const raw = messageEntry("raw-malformed-support", "user", "The exact source is on the branch.");
+  const malformedObservation = {
+    type: "custom",
+    id: "observation-malformed-support",
+    customType: "pi-session-memory.observation",
+    data: { schemaVersion: 1, text: "This malformed observation must not be returned.", sourceEntryIds: [raw.id, 42] },
+  };
+  const reflection = {
+    type: "custom",
+    id: "reflection-malformed-support",
+    customType: "pi-session-memory.reflection",
+    data: { schemaVersion: 1, text: "The linked observation is malformed.", supportingObservationIds: [malformedObservation.id] },
+  };
+  const runtime = hydrationTool([raw, malformedObservation, reflection]);
+
+  const malformedObservationResult = resultData(await runtime.tool.execute("call-1", {
+    reflectionId: reflection.id,
+    depth: "raw",
+  }, undefined, undefined, runtime.context));
+  assert.equal(malformedObservationResult.status, "partial");
+  assert.deepEqual(malformedObservationResult.missingIds, [malformedObservation.id]);
+  assert.deepEqual(malformedObservationResult.observations, []);
+  assert.deepEqual(malformedObservationResult.rawEntries, []);
+  assert.equal(malformedObservationResult.exactEvidenceRecovered, false);
+  assert.equal(JSON.stringify(malformedObservationResult).includes(malformedObservation.data.text), false);
+
+  const malformedReflection = {
+    ...reflection,
+    id: "reflection-invalid-links",
+    data: { schemaVersion: 1, text: "Invalid links cannot establish a recoverable reflection.", supportingObservationIds: [malformedObservation.id, 42] },
+  };
+  runtime.context.sessionManager.getBranch = () => [raw, malformedObservation, malformedReflection];
+  const malformedReflectionResult = resultData(await runtime.tool.execute("call-2", {
+    reflectionId: malformedReflection.id,
+    depth: "observation",
+  }, undefined, undefined, runtime.context));
+  assert.equal(malformedReflectionResult.status, "partial");
+  assert.deepEqual(malformedReflectionResult.missingIds, [malformedReflection.id]);
+  assert.equal(malformedReflectionResult.reflection, undefined);
+  assert.equal(malformedReflectionResult.exactEvidenceRecovered, false);
+  assert.equal(JSON.stringify(malformedReflectionResult).includes(malformedReflection.data.text), false);
 });
 
 test("reports missing sibling observations while exposing only the requested observation", async () => {

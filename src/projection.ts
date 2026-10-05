@@ -1,4 +1,5 @@
 import type { ContextEvent, ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
+import { supersessionStatuses } from "./supersession.ts";
 
 const OBSERVATION_TYPE = "pi-session-memory.observation";
 const REFLECTION_TYPE = "pi-session-memory.reflection";
@@ -75,7 +76,7 @@ export function registerProjection(pi: ExtensionAPI, evaluate: EvaluateProjectio
   pi.on("context", async (event, ctx) => {
     try {
       const sessionId = ctx.sessionManager.getSessionId();
-      const branch = ctx.sessionManager.getBranch();
+      let branch = ctx.sessionManager.getBranch();
       const originalMessages = event.messages;
       const latestUserText = lastUserText(originalMessages);
       if (!latestUserText) return { messages: originalMessages };
@@ -83,7 +84,7 @@ export function registerProjection(pi: ExtensionAPI, evaluate: EvaluateProjectio
       const outputLimit = configuredBound(pi.getFlag(PROJECTION_LIMIT_FLAG), DEFAULT_PROJECTION_CHARS, MAX_PROJECTION_CHARS);
       if (limit === undefined || outputLimit === undefined) return { messages: originalMessages };
 
-      const candidates = activeCandidates(branch);
+      let candidates = currentCandidates(branch);
       const currentTerms = words(latestUserText);
       const memoryNeed = needsMemory(latestUserText, currentTerms, candidates);
       if (!memoryNeed) return { messages: originalMessages };
@@ -95,20 +96,22 @@ export function registerProjection(pi: ExtensionAPI, evaluate: EvaluateProjectio
           const state = encodeState({ need: truncate(latestUserText, MAX_NEED_CHARS), candidate: { entryId: resident.entryId, kind: resident.kind, text: resident.text } });
           if (!state) return { messages: originalMessages };
           const decision = await evaluate(sessionId, { gate: "resident", state }, ctx);
+          const currentBranch = ctx.sessionManager.getBranch();
+          if (ctx.sessionManager.getSessionId() !== sessionId) return { messages: originalMessages };
+          const currentResident = candidateById(currentBranch, resident.entryId);
+          if (!currentResident || currentResident.text !== resident.text || currentResident.kind !== resident.kind) {
+            residents.delete(sessionId);
+            return { messages: originalMessages };
+          }
           if (!isSufficiencyDecision(decision)) return { messages: originalMessages };
           if (decision.accepted) {
-            const currentBranch = ctx.sessionManager.getBranch();
-            if (ctx.sessionManager.getSessionId() !== sessionId) return { messages: originalMessages };
-            const currentResident = candidateById(currentBranch, resident.entryId);
-            if (!currentResident || currentResident.text !== resident.text || currentResident.kind !== resident.kind) {
-              residents.delete(sessionId);
-              return { messages: originalMessages };
-            }
             const text = renderCandidate(currentResident);
             if (text.length > outputLimit) return { messages: originalMessages };
             residents.set(sessionId, asResident(currentResident));
             return { messages: withProjection(originalMessages, text) };
           }
+          branch = currentBranch;
+          candidates = currentCandidates(branch);
         }
         residents.delete(sessionId);
       }
@@ -144,6 +147,11 @@ export function registerProjection(pi: ExtensionAPI, evaluate: EvaluateProjectio
   });
 
   return () => residents.clear();
+}
+
+export function currentCandidates(branch: SessionEntry[]): Candidate[] {
+  const statuses = supersessionStatuses(branch);
+  return activeCandidates(branch).filter(({ entryId }) => statuses.get(entryId)?.status === "current");
 }
 
 function activeCandidates(branch: SessionEntry[]): Candidate[] {
@@ -204,7 +212,7 @@ function activeCandidates(branch: SessionEntry[]): Candidate[] {
 }
 
 function candidateById(branch: SessionEntry[], entryId: string): Candidate | undefined {
-  return activeCandidates(branch).find((candidate) => candidate.entryId === entryId);
+  return currentCandidates(branch).find((candidate) => candidate.entryId === entryId);
 }
 
 function needsMemory(need: string, terms: Set<string>, candidates: Candidate[]): boolean {

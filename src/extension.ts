@@ -6,15 +6,18 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext, SessionEntry, SessionStartEvent, TurnEndEvent } from "@earendil-works/pi-coding-agent";
 import { registerHydration } from "./hydration.ts";
-import { registerProjection, type ProjectionGateRequest, type ProjectionSelectionDecision } from "./projection.ts";
+import { currentCandidates, registerProjection, type ProjectionGateRequest, type ProjectionSelectionDecision } from "./projection.ts";
+import { classifySupersessionDecision, supersessionStatuses, type SupersessionData } from "./supersession.ts";
 
 const OBSERVATION_TYPE = "pi-session-memory.observation";
 const REFLECTION_TYPE = "pi-session-memory.reflection";
+const SUPERSESSION_TYPE = "pi-session-memory.supersession";
 const PROTOCOL_VERSION = 1;
 const MAX_GATE_STATE_BYTES = 8_000;
 const MAX_MEMORY_TEXT_CHARS = 1_000;
 const MAX_RAW_SOURCES = 12;
 const MAX_REFLECTION_SOURCES = 6;
+const MAX_SUPERSESSION_CANDIDATES = 8;
 // Covers the measured ~1.3s MPS load plus inference; this internal fail-native guard is not a latency SLA.
 const WORKER_REQUEST_TIMEOUT_MS = 30_000;
 const OBSERVE_FLAG = "e01-observe-after-tokens";
@@ -25,7 +28,7 @@ const DISCLOSURE =
 const WORKER_FAILURE_NOTICE = "Session memory worker unavailable; continuing with native Pi context.";
 type LayaWorkerProcess = ChildProcessByStdio<Writable, Readable, null>;
 
-export type FormationGate = "observation" | "reflection" | "resident" | "projection";
+export type FormationGate = "observation" | "reflection" | "resident" | "projection" | "supersession";
 export interface GateRequest {
   gate: FormationGate;
   state: string;
@@ -74,6 +77,7 @@ interface LinkedObservation {
   entryId: string;
   data: ObservationData;
 }
+type MemoryCandidate = ReturnType<typeof currentCandidates>[number];
 
 class LayaWorker {
   private child: LayaWorkerProcess | undefined;
@@ -285,18 +289,25 @@ async function formForTurn(
   if (observationDue) {
     const sources = rawSourcesForTurn(event, branch);
     if (sources.length > 0) {
-      const state = encodeGateState({ sourceEntryIds: sources.map(({ entryId }) => entryId), sources });
+      const state = encodeGateState({ sourceEntryIds: sources.map(({ entryId }) => entryId), sources }, "observation");
       if (state) {
         const decision = await gate(sessionId, { gate: "observation", state }, ctx);
-        if (isGateDecision(decision) && decision.accepted) await generateObservation(pi, ctx, sessionId, sources, consentedSessions);
+        if (isGateDecision(decision) && decision.accepted) {
+          const observationId = await generateObservation(pi, ctx, sessionId, sources, consentedSessions);
+          if (observationId) await supersedeMemories(pi, ctx, sessionId, observationId, sources, gate);
+        }
       }
     }
   }
 
   if (reflectionDue) {
-    const observations = linkedObservations(ctx.sessionManager.getBranch()).slice(-MAX_REFLECTION_SOURCES);
+    const branch = ctx.sessionManager.getBranch();
+    const statuses = supersessionStatuses(branch);
+    const observations = linkedObservations(branch)
+      .filter(({ entryId }) => statuses.get(entryId)?.status === "current")
+      .slice(-MAX_REFLECTION_SOURCES);
     if (observations.length >= 2) {
-      const state = encodeGateState({ observations: observations.map(({ entryId, data }) => ({ entryId, text: data.text, sourceEntryIds: data.sourceEntryIds })) });
+      const state = encodeGateState({ observations: observations.map(({ entryId, data }) => ({ entryId, text: data.text, sourceEntryIds: data.sourceEntryIds })) }, "reflection");
       if (state) {
         const decision = await gate(sessionId, { gate: "reflection", state }, ctx);
         if (isGateDecision(decision) && decision.accepted) await generateReflection(pi, ctx, sessionId, observations, consentedSessions);
@@ -311,17 +322,85 @@ async function generateObservation(
   sessionId: string,
   sources: RawSource[],
   consentedSessions: Set<string>,
-): Promise<void> {
+): Promise<string | undefined> {
   const model = await enabledModel(pi, ctx, sessionId, consentedSessions);
-  if (!model) return;
+  if (!model) return undefined;
   const sourceEntryIds = sources.map(({ entryId }) => entryId);
   const prompt = `Write one concise durable observation, at most two sentences. Return only the observation text; do not invent or emit source IDs.\n\nSupporting session evidence:\n${JSON.stringify(sources)}`;
   const text = await generateText(ctx, model, prompt);
-  if (!text) return;
+  if (!text || ctx.sessionManager.getSessionId() !== sessionId) return undefined;
   const branch = ctx.sessionManager.getBranch();
-  if (!activeRawSources(branch, sourceEntryIds)) return;
+  if (!activeRawSources(branch, sourceEntryIds)) return undefined;
+  const existingIds = new Set(branch.map(({ id }) => id));
   const data: ObservationData = { schemaVersion: 1, text, sourceEntryIds };
   pi.appendEntry(OBSERVATION_TYPE, data);
+  if (ctx.sessionManager.getSessionId() !== sessionId) return undefined;
+  const appended = ctx.sessionManager.getBranch().filter((entry) =>
+    !existingIds.has(entry.id) && isCustomEntry(entry, OBSERVATION_TYPE) && isObservationData(entry.data) &&
+    entry.data.text === data.text && sameStrings(entry.data.sourceEntryIds, data.sourceEntryIds),
+  );
+  return appended.length === 1 ? appended[0].id : undefined;
+}
+
+async function supersedeMemories(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  sessionId: string,
+  replacementEntryId: string,
+  sources: RawSource[],
+  gate: (sessionId: string, request: GateRequest, ctx: ExtensionContext) => Promise<GateResult>,
+): Promise<void> {
+  const branch = ctx.sessionManager.getBranch();
+  if (ctx.sessionManager.getSessionId() !== sessionId || !rawSourcesStillActive(branch, sources)) return;
+  const candidates = currentCandidates(branch);
+  const replacement = candidates.find(({ entryId, kind }) => entryId === replacementEntryId && kind === "observation");
+  if (!replacement || !sameStrings(replacement.sourceEntryIds, sources.map(({ entryId }) => entryId))) return;
+  const oldCandidates = candidates
+    .filter(({ entryId, branchIndex }) => entryId !== replacementEntryId && branchIndex < replacement.branchIndex)
+    .slice(-MAX_SUPERSESSION_CANDIDATES)
+    .reverse();
+
+  for (const oldMemory of oldCandidates) {
+    const state = encodeGateState({
+      oldMemory: { entryId: oldMemory.entryId, kind: oldMemory.kind, text: oldMemory.text },
+      newEvidence: {
+        entryId: replacement.entryId,
+        text: replacement.text,
+        sourceEntryIds: replacement.sourceEntryIds,
+        sources,
+      },
+    }, "supersession");
+    let outcome: ReturnType<typeof classifySupersessionDecision>;
+    if (!state) {
+      outcome = { status: "unresolved" };
+    } else {
+      try {
+        outcome = classifySupersessionDecision(await gate(sessionId, { gate: "supersession", state }, ctx));
+      } catch {
+        outcome = { status: "unresolved" };
+      }
+    }
+    if (outcome.status === "rejected") continue;
+
+    const currentBranch = ctx.sessionManager.getBranch();
+    if (ctx.sessionManager.getSessionId() !== sessionId ||
+        !supersessionLinksStillActive(currentBranch, oldMemory, replacement, sources)) continue;
+    const data: SupersessionData = outcome.status === "superseded"
+      ? {
+          schemaVersion: 1,
+          status: "superseded",
+          supersededEntryId: oldMemory.entryId,
+          replacementEntryId: replacement.entryId,
+          decision: outcome.decision,
+        }
+      : {
+          schemaVersion: 1,
+          status: "unresolved",
+          supersededEntryId: oldMemory.entryId,
+          replacementEntryId: replacement.entryId,
+        };
+    pi.appendEntry(SUPERSESSION_TYPE, data);
+  }
 }
 
 async function generateReflection(
@@ -336,8 +415,10 @@ async function generateReflection(
   const supportingObservationIds = observations.map(({ entryId }) => entryId);
   const prompt = `Synthesize only a stable insight supported by these linked observations. Write at most two sentences and return only the reflection text; do not emit IDs.\n\nSupporting observations:\n${JSON.stringify(observations.map(({ entryId, data }) => ({ entryId, text: data.text, sourceEntryIds: data.sourceEntryIds })))}`;
   const text = await generateText(ctx, model, prompt);
-  if (!text) return;
-  const current = linkedObservations(ctx.sessionManager.getBranch());
+  if (!text || ctx.sessionManager.getSessionId() !== sessionId) return;
+  const branch = ctx.sessionManager.getBranch();
+  const statuses = supersessionStatuses(branch);
+  const current = linkedObservations(branch).filter(({ entryId }) => statuses.get(entryId)?.status === "current");
   const available = new Set(current.map(({ entryId }) => entryId));
   if (!supportingObservationIds.every((id) => available.has(id))) return;
   const data: ReflectionData = { schemaVersion: 1, text, supportingObservationIds };
@@ -424,6 +505,43 @@ function activeRawSources(branch: SessionEntry[], sourceEntryIds: string[]): boo
   return sourceEntryIds.every((id) => rawIds.has(id));
 }
 
+function rawSourcesStillActive(branch: SessionEntry[], sources: RawSource[]): boolean {
+  if (sources.length === 0 || new Set(sources.map(({ entryId }) => entryId)).size !== sources.length) return false;
+  const byId = new Map(branch.filter(isMessageEntry).map((entry) => [entry.id, entry]));
+  const perSourceBytes = Math.floor(5_000 / sources.length);
+  return sources.every((source) => {
+    const entry = byId.get(source.entryId);
+    return entry !== undefined && entry.message.role === source.role &&
+      truncateUtf8(messageText(entry.message), perSourceBytes) === source.text;
+  });
+}
+
+function supersessionLinksStillActive(
+  branch: SessionEntry[],
+  oldMemory: MemoryCandidate,
+  replacement: MemoryCandidate,
+  sources: RawSource[],
+): boolean {
+  const current = currentCandidates(branch);
+  const oldNow = current.find(({ entryId }) => entryId === oldMemory.entryId);
+  const replacementNow = current.find(({ entryId }) => entryId === replacement.entryId);
+  return oldNow !== undefined && replacementNow !== undefined &&
+    sameCandidate(oldNow, oldMemory) && sameCandidate(replacementNow, replacement) &&
+    oldNow.branchIndex < replacementNow.branchIndex &&
+    sameStrings(replacementNow.sourceEntryIds, sources.map(({ entryId }) => entryId)) &&
+    rawSourcesStillActive(branch, sources);
+}
+
+function sameCandidate(left: MemoryCandidate, right: MemoryCandidate): boolean {
+  return left.entryId === right.entryId && left.kind === right.kind && left.text === right.text &&
+    left.sourceText === right.sourceText && sameStrings(left.observationIds, right.observationIds) &&
+    sameStrings(left.sourceEntryIds, right.sourceEntryIds);
+}
+
+function sameStrings(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
 function latestAssistantUsageTokens(branch: SessionEntry[], beforeId?: string): number {
   const stopAt = beforeId === undefined ? branch.length : branch.findIndex(({ id }) => id === beforeId);
   for (let index = (stopAt < 0 ? branch.length : stopAt) - 1; index >= 0; index -= 1) {
@@ -443,10 +561,10 @@ function assistantUsageTokens(message: Extract<SessionEntry, { type: "message" }
   return Number.isFinite(total) && total > 0 ? total : undefined;
 }
 
-function encodeGateState(value: unknown): string | undefined {
+function encodeGateState(value: unknown, gate: FormationGate): string | undefined {
   const encoded = JSON.stringify(value);
   if (encoded === undefined) return undefined;
-  const request = JSON.stringify({ protocol_version: PROTOCOL_VERSION, request_id: "00000000-0000-0000-0000-000000000000", gate: "reflection", state: encoded });
+  const request = JSON.stringify({ protocol_version: PROTOCOL_VERSION, request_id: "00000000-0000-0000-0000-000000000000", gate, state: encoded });
   return Buffer.byteLength(encoded, "utf8") <= MAX_GATE_STATE_BYTES && Buffer.byteLength(request, "utf8") < 16_384 ? encoded : undefined;
 }
 
@@ -488,6 +606,10 @@ function isProbability(value: unknown): value is number {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isCustomEntry(entry: unknown, customType: string): entry is Extract<SessionEntry, { type: "custom" }> {
+  return isRecord(entry) && entry.type === "custom" && entry.customType === customType && typeof entry.id === "string";
 }
 
 function isMessageEntry(entry: unknown): entry is Extract<SessionEntry, { type: "message" }> {

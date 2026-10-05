@@ -7,6 +7,7 @@ import { registerFormation } from "../../src/extension.ts";
 
 const observationType = "pi-session-memory.observation";
 const reflectionType = "pi-session-memory.reflection";
+const supersessionType = "pi-session-memory.supersession";
 
 function rawMessage(id, role, content, inputTokens = 0) {
   const message = role === "assistant"
@@ -24,7 +25,7 @@ function rawMessage(id, role, content, inputTokens = 0) {
   return { type: "message", id, parentId: null, timestamp: new Date().toISOString(), message };
 }
 
-function testRuntime({ enabled = false, observeAfter = 1, reflectAfter = 1, gateResults = [], approve = true, onComplete, useRealWorker = false, timeoutScheduler } = {}) {
+function testRuntime({ enabled = false, observeAfter = 1, reflectAfter = 1, gateResults = [], approve = true, onComplete, onGate, useRealWorker = false, timeoutScheduler } = {}) {
   let branch = [];
   const handlers = new Map();
   const flags = new Map();
@@ -74,7 +75,7 @@ function testRuntime({ enabled = false, observeAfter = 1, reflectAfter = 1, gate
       complete: async (model, context) => {
         providerCalls.push({ model, context });
         completionNumber += 1;
-        onComplete?.({ branch, replaceBranch: (next) => { branch = next; }, context, model });
+        onComplete?.({ branch, replaceBranch: (next) => { branch = next; }, setSessionId: (next) => { sessionId = next; }, context, model });
         return {
           role: "assistant",
           content: [{ type: "text", text: `Generated memory ${completionNumber}` }],
@@ -91,7 +92,7 @@ function testRuntime({ enabled = false, observeAfter = 1, reflectAfter = 1, gate
 
   const evaluateGate = useRealWorker ? undefined : async (request) => {
     gateRequests.push(request);
-    return gateResults.shift() ?? { accepted: true, p_true: 0.9, confidence: 0.8 };
+    return onGate ? onGate(request) : gateResults.shift() ?? { accepted: true, p_true: 0.9, confidence: 0.8 };
   };
   registerFormation(pi, useRealWorker ? { timeoutScheduler } : { evaluateGate });
 
@@ -136,14 +137,24 @@ function testRuntime({ enabled = false, observeAfter = 1, reflectAfter = 1, gate
 }
 
 test("separate token cadences form two observations before an independently due reflection", async () => {
-  const runtime = testRuntime({ observeAfter: 10, reflectAfter: 20, enabled: true });
+  const runtime = testRuntime({
+    observeAfter: 10,
+    reflectAfter: 20,
+    enabled: true,
+    gateResults: [
+      { accepted: true, p_true: 0.9, confidence: 0.8 },
+      { accepted: true, p_true: 0.9, confidence: 0.8 },
+      { accepted: false, p_true: 0.1, confidence: 0.9 },
+      { accepted: true, p_true: 0.9, confidence: 0.8 },
+    ],
+  });
   await runtime.start();
   await runtime.turn({ userId: "user-1", assistantId: "assistant-1", userText: "The Pi session remains canonical and observations cite exact raw IDs.", inputTokens: 10 });
   assert.deepEqual(runtime.gateRequests.map(({ gate }) => gate), ["observation"]);
   assert.equal(runtime.entries.length, 1);
 
   await runtime.turn({ userId: "user-2", assistantId: "assistant-2", userText: "Reflections link only to observations and preserve append-only history.", inputTokens: 30 });
-  assert.deepEqual(runtime.gateRequests.map(({ gate }) => gate), ["observation", "observation", "reflection"]);
+  assert.deepEqual(runtime.gateRequests.map(({ gate }) => gate), ["observation", "observation", "supersession", "reflection"]);
   assert.equal(runtime.providerCalls.length, 3);
   assert.equal(runtime.disclosures.length, 1);
   assert.match(runtime.disclosures[0].message, /Session-derived text/);
@@ -215,6 +226,38 @@ test("generation does not run when the enabled operator declines the session-dat
   assert.equal(runtime.disclosures.length, 1);
 });
 
+test("an observation response from an obsolete session is not appended to the current branch", async () => {
+  const runtime = testRuntime({
+    enabled: true,
+    onComplete: ({ setSessionId }) => setSessionId("replacement-session"),
+  });
+  await runtime.start();
+  await runtime.turn({ userId: "user-old-session", assistantId: "assistant-old-session", userText: "Synthetic old-session evidence.", inputTokens: 1 });
+
+  assert.equal(runtime.providerCalls.length, 1);
+  assert.equal(runtime.entries.length, 0, "a response for an obsolete session cannot append even while the old source IDs remain present");
+});
+
+test("a reflection response from an obsolete session is not appended to the current branch", async () => {
+  const rawOne = rawMessage("raw-session-one", "user", "First synthetic linked fact.");
+  const rawTwo = rawMessage("raw-session-two", "user", "Second synthetic linked fact.");
+  const observationOne = { type: "custom", id: "observation-session-one", customType: observationType, data: { schemaVersion: 1, text: "First linked fact.", sourceEntryIds: [rawOne.id] } };
+  const observationTwo = { type: "custom", id: "observation-session-two", customType: observationType, data: { schemaVersion: 1, text: "Second linked fact.", sourceEntryIds: [rawTwo.id] } };
+  const runtime = testRuntime({
+    enabled: true,
+    observeAfter: 100,
+    reflectAfter: 1,
+    onComplete: ({ setSessionId }) => setSessionId("replacement-session"),
+  });
+  runtime.setBranch([rawOne, observationOne, rawTwo, observationTwo]);
+  await runtime.start();
+  await runtime.turn({ userId: "user-reflection-session", assistantId: "assistant-reflection-session", userText: "Synthesize the linked facts.", inputTokens: 1 });
+
+  assert.deepEqual(runtime.gateRequests.map(({ gate }) => gate), ["reflection"]);
+  assert.equal(runtime.providerCalls.length, 1);
+  assert.equal(runtime.entries.length, 0, "a reflection response cannot append to another session that reuses the support branch");
+});
+
 test("an observation with a source removed from the active branch is not appended", async () => {
   const runtime = testRuntime({ enabled: true, onComplete: ({ branch, replaceBranch }) => replaceBranch(branch.filter(({ id }) => id !== "user-stale")) });
   await runtime.start();
@@ -222,6 +265,119 @@ test("an observation with a source removed from the active branch is not appende
 
   assert.equal(runtime.providerCalls.length, 1);
   assert.equal(runtime.entries.length, 0);
+});
+
+test("a confident supersession decision appends a linked status record without deleting prior evidence", async () => {
+  const oldRaw = rawMessage("raw-old-understanding", "user", "Earlier evidence supports the old synthetic policy.");
+  const oldObservation = {
+    type: "custom",
+    id: "observation-old-understanding",
+    customType: observationType,
+    data: { schemaVersion: 1, text: "The old synthetic policy is enabled.", sourceEntryIds: [oldRaw.id] },
+  };
+  const runtime = testRuntime({
+    enabled: true,
+    observeAfter: 1,
+    reflectAfter: 100,
+    gateResults: [
+      { accepted: true, p_true: 0.95, confidence: 0.9 },
+      { accepted: true, p_true: 0.92, confidence: 0.88 },
+    ],
+  });
+  runtime.setBranch([oldRaw, oldObservation]);
+  await runtime.start();
+  await runtime.turn({ userId: "raw-new-evidence", assistantId: "assistant-new-evidence", userText: "New evidence replaces the old synthetic policy.", inputTokens: 1 });
+
+  const newObservation = runtime.entries.find(({ customType }) => customType === observationType);
+  const record = runtime.entries.find(({ customType }) => customType === supersessionType);
+  assert.ok(newObservation);
+  assert.deepEqual(runtime.gateRequests.map(({ gate }) => gate), ["observation", "supersession"]);
+  const state = JSON.parse(runtime.gateRequests[1].state);
+  assert.deepEqual(state.oldMemory, { entryId: oldObservation.id, kind: "observation", text: oldObservation.data.text });
+  assert.deepEqual(state.newEvidence, {
+    entryId: newObservation.id,
+    text: newObservation.data.text,
+    sourceEntryIds: newObservation.data.sourceEntryIds,
+    sources: [
+      { entryId: "raw-new-evidence", role: "user", text: "New evidence replaces the old synthetic policy." },
+      { entryId: "assistant-new-evidence", role: "assistant", text: "Turn complete" },
+    ],
+  });
+  assert.deepEqual(record.data, {
+    schemaVersion: 1,
+    status: "superseded",
+    supersededEntryId: oldObservation.id,
+    replacementEntryId: newObservation.id,
+    decision: { accepted: true, p_true: 0.92, confidence: 0.88 },
+  });
+  assert.ok(runtime.ctx.sessionManager.getBranch().some(({ id }) => id === oldObservation.id));
+  assert.ok(runtime.ctx.sessionManager.getBranch().some(({ id }) => id === oldRaw.id));
+});
+
+test("an uncertain supersession decision records the old memory as unresolved instead of current", async () => {
+  const oldRaw = rawMessage("raw-uncertain-old", "user", "Earlier synthetic evidence.");
+  const oldObservation = {
+    type: "custom",
+    id: "observation-uncertain-old",
+    customType: observationType,
+    data: { schemaVersion: 1, text: "An old synthetic policy.", sourceEntryIds: [oldRaw.id] },
+  };
+  const runtime = testRuntime({
+    enabled: true,
+    reflectAfter: 100,
+    gateResults: [
+      { accepted: true, p_true: 0.95, confidence: 0.9 },
+      { accepted: true, p_true: 0.6, confidence: 0.6 },
+    ],
+  });
+  runtime.setBranch([oldRaw, oldObservation]);
+  await runtime.start();
+  await runtime.turn({ userId: "raw-uncertain-new", assistantId: "assistant-uncertain-new", userText: "Potentially conflicting new evidence.", inputTokens: 1 });
+
+  const record = runtime.entries.find(({ customType }) => customType === supersessionType);
+  assert.deepEqual(record.data, {
+    schemaVersion: 1,
+    status: "unresolved",
+    supersededEntryId: oldObservation.id,
+    replacementEntryId: "custom-1",
+  });
+  assert.equal(record.data.status, "unresolved", "an uncertain verdict must not assert that replacement evidence is current");
+});
+
+test("a supersession response for an obsolete session cannot append its status record", async () => {
+  const oldRaw = rawMessage("raw-session-old", "user", "Earlier synthetic evidence.");
+  const oldObservation = {
+    type: "custom",
+    id: "observation-session-old",
+    customType: observationType,
+    data: { schemaVersion: 1, text: "An old synthetic policy.", sourceEntryIds: [oldRaw.id] },
+  };
+  let supersessionStarted;
+  const started = new Promise((resolveStarted) => { supersessionStarted = resolveStarted; });
+  let releaseSupersession;
+  const pendingSupersession = new Promise((resolveSupersession) => { releaseSupersession = resolveSupersession; });
+  const runtime = testRuntime({
+    enabled: true,
+    reflectAfter: 100,
+    onGate: async (request) => {
+      if (request.gate === "supersession") {
+        supersessionStarted();
+        await pendingSupersession;
+      }
+      return { accepted: true, p_true: 0.95, confidence: 0.9 };
+    },
+  });
+  runtime.setBranch([oldRaw, oldObservation]);
+  await runtime.start();
+  const turn = runtime.turn({ userId: "raw-session-new", assistantId: "assistant-session-new", userText: "New synthetic evidence.", inputTokens: 1 });
+  const gateState = await Promise.race([started.then(() => "started"), turn.then(() => "finished")]);
+  assert.equal(gateState, "started", "the accepted new observation must be checked for supersession");
+  await runtime.switchSession("replacement-session");
+  releaseSupersession();
+  await turn;
+
+  assert.equal(runtime.entries.some(({ customType }) => customType === supersessionType), false);
+  assert.equal(runtime.ctx.sessionManager.getBranch().length, 0);
 });
 
 function manualTimeoutScheduler() {
@@ -310,6 +466,101 @@ process.stdin.on("data", () => process.stdout.write("not-json\\n"));
   ], "each failed worker reports once, and the new session gets its own report");
   assert.equal(runtime.providerCalls.length, 0);
   assert.equal(runtime.entries.length, 0);
+});
+
+test("a worker startup error leaves native context unchanged and stays latched for the session", { timeout: 15_000 }, async (t) => {
+  const workerDir = await mkdtemp(join(tmpdir(), "pi-session-memory-unavailable-worker-"));
+  const envKeys = ["PI_SESSION_MEMORY_PYTHON"];
+  const previousEnv = new Map(envKeys.map((key) => [key, process.env[key]]));
+  process.env.PI_SESSION_MEMORY_PYTHON = join(workerDir, "missing-python");
+
+  const runtime = testRuntime({ enabled: true, useRealWorker: true });
+  t.after(async () => {
+    await runtime.shutdown();
+    for (const [key, value] of previousEnv) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await rm(workerDir, { recursive: true, force: true });
+  });
+
+  await runtime.start();
+  const privateText = "Unique private startup text must never appear in worker warnings.";
+  await runtime.turn({ userId: "user-startup-error", assistantId: "assistant-startup-error", userText: privateText, inputTokens: 1 });
+  assert.deepEqual(runtime.notifications, [{ message: "Session memory worker unavailable; continuing with native Pi context.", type: "warning" }]);
+  assert.equal(JSON.stringify(runtime.notifications).includes(privateText), false);
+  assert.equal(runtime.providerCalls.length, 0);
+  assert.equal(runtime.entries.length, 0);
+
+  await runtime.turn({ userId: "user-startup-followup", assistantId: "assistant-startup-followup", userText: "A later request in this session.", inputTokens: 2 });
+  assert.equal(runtime.notifications.length, 1, "an unavailable worker must not cause repeated warnings");
+
+  const source = rawMessage("startup-context-source", "user", "Synthetic linked evidence.");
+  runtime.setBranch([
+    source,
+    { type: "custom", id: "startup-context-memory", customType: observationType, data: { schemaVersion: 1, text: "A previously confirmed synthetic fact.", sourceEntryIds: [source.id] } },
+  ]);
+  const messages = [{ role: "user", content: [{ type: "text", text: "What did we decide earlier about this synthetic fact?" }], timestamp: 1 }];
+  assert.deepEqual(await runtime.handlers.get("context")({ type: "context", messages }, runtime.ctx), { messages });
+});
+
+test("a worker process exit withholds memory, preserves native context, and does not retry", { timeout: 15_000 }, async (t) => {
+  const workerDir = await mkdtemp(join(tmpdir(), "pi-session-memory-exit-worker-"));
+  const workerScript = join(workerDir, "fake-worker.js");
+  const fakePython = join(workerDir, "fake-python");
+  const launchesFile = join(workerDir, "launches.txt");
+  const receivedFile = join(workerDir, "received.txt");
+  await writeFile(workerScript, `
+const fs = require("node:fs");
+fs.appendFileSync(process.env.PI_SESSION_MEMORY_TEST_LAUNCHES, "started\\n");
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", () => {
+  fs.writeFileSync(process.env.PI_SESSION_MEMORY_TEST_RECEIVED, "received");
+  process.exit(17);
+});
+`);
+  await writeFile(fakePython, '#!/bin/sh\nexec "$PI_SESSION_MEMORY_TEST_NODE" "$PI_SESSION_MEMORY_TEST_WORKER"\n');
+  await chmod(fakePython, 0o755);
+
+  const envKeys = ["PI_SESSION_MEMORY_PYTHON", "PI_SESSION_MEMORY_TEST_NODE", "PI_SESSION_MEMORY_TEST_WORKER", "PI_SESSION_MEMORY_TEST_LAUNCHES", "PI_SESSION_MEMORY_TEST_RECEIVED"];
+  const previousEnv = new Map(envKeys.map((key) => [key, process.env[key]]));
+  process.env.PI_SESSION_MEMORY_PYTHON = fakePython;
+  process.env.PI_SESSION_MEMORY_TEST_NODE = process.execPath;
+  process.env.PI_SESSION_MEMORY_TEST_WORKER = workerScript;
+  process.env.PI_SESSION_MEMORY_TEST_LAUNCHES = launchesFile;
+  process.env.PI_SESSION_MEMORY_TEST_RECEIVED = receivedFile;
+
+  const runtime = testRuntime({ enabled: true, useRealWorker: true });
+  t.after(async () => {
+    await runtime.shutdown();
+    for (const [key, value] of previousEnv) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await rm(workerDir, { recursive: true, force: true });
+  });
+
+  await runtime.start();
+  const turn = runtime.turn({ userId: "user-worker-exit", assistantId: "assistant-worker-exit", userText: "Unique private process-exit text.", inputTokens: 1 });
+  assert.equal(await waitForFile(receivedFile, 10_000), "received", "the controlled worker must receive the request before exiting");
+  await turn;
+  assert.equal((await readFile(launchesFile, "utf8")).trim().split("\n").length, 1);
+  assert.equal(runtime.providerCalls.length, 0);
+  assert.equal(runtime.entries.length, 0);
+  assert.deepEqual(runtime.notifications, [{ message: "Session memory worker unavailable; continuing with native Pi context.", type: "warning" }]);
+  assert.equal(JSON.stringify(runtime.notifications).includes("Unique private process-exit text."), false);
+
+  await runtime.turn({ userId: "user-worker-exit-followup", assistantId: "assistant-worker-exit-followup", userText: "A later request in this session.", inputTokens: 2 });
+  assert.equal((await readFile(launchesFile, "utf8")).trim().split("\n").length, 1, "an exited worker must not be automatically restarted");
+  assert.equal(runtime.notifications.length, 1);
+
+  const source = rawMessage("exit-context-source", "user", "Synthetic linked evidence.");
+  runtime.setBranch([
+    source,
+    { type: "custom", id: "exit-context-memory", customType: observationType, data: { schemaVersion: 1, text: "A previously confirmed synthetic fact.", sourceEntryIds: [source.id] } },
+  ]);
+  const messages = [{ role: "user", content: [{ type: "text", text: "What did we decide earlier about this synthetic fact?" }], timestamp: 1 }];
+  assert.deepEqual(await runtime.handlers.get("context")({ type: "context", messages }, runtime.ctx), { messages });
 });
 
 test("the default python3.11 worker handles a JSONL request without warning", { timeout: 15_000 }, async (t) => {

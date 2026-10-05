@@ -32,6 +32,11 @@ interface EventWaiter {
   timer: ReturnType<typeof setTimeout>;
 }
 
+interface SmallContextModelRegistration {
+  provider: string;
+  definition: RpcRecord;
+}
+
 class PiRpc {
   private readonly child: ChildProcessWithoutNullStreams;
   private readonly exited: Promise<void>;
@@ -57,7 +62,8 @@ class PiRpc {
       "--session", sessionFile,
       "--tools", "hydrate_session_memory",
       "--system-prompt", "Synthetic e01 integration only. Use only the supplied synthetic session entries.",
-      "--thinking", "off",
+      ...(process.env.PI_SESSION_MEMORY_E01_MODEL ? ["--model", process.env.PI_SESSION_MEMORY_E01_MODEL] : []),
+      "--thinking", process.env.PI_SESSION_MEMORY_E01_THINKING ?? "off",
       "--approve",
       "--no-context-files",
       "--no-skills",
@@ -210,12 +216,12 @@ class PiRpc {
   }
 }
 
-test("real native compaction and same-session resume preserve linked hydration and fail native on worker uncertainty", {
+test("Pi 1.0.2 low-context auto-compaction and same-session resume preserve linked hydration and fail native on worker uncertainty", {
   timeout: 900_000,
   skip: realPiOptIn ? false : "Set PI_SESSION_MEMORY_E01_REAL_PI=1 to opt into disposable synthetic provider calls; skipped means zero Pi/provider calls.",
 }, async (t) => {
   assert.equal(process.env.PI_SESSION_MEMORY_E01_REAL_PI, "1", "provider-backed compaction requires explicit test opt-in");
-  t.diagnostic("Provider disclosure: after validating a fresh temporary session path, this test sends only synthetic session content to the current configured Pi provider for native RPC compaction and hydration-tool interaction; memory generation is not enabled.");
+  t.diagnostic("Provider disclosure: after validating a fresh temporary session path, this test sends only synthetic session content to the configured Pi provider. It overrides contextWindow/maxTokens only in the disposable Pi process to exercise 32k threshold auto-compaction, then tests same-session resume, hydration-tool interaction, native compaction, and cancellation; memory generation is not enabled.");
 
   const tempRoot = await mkdtemp(resolve(tmpdir(), "pi-session-memory-e01s04-"));
   let rpc: PiRpc | undefined;
@@ -234,7 +240,7 @@ test("real native compaction and same-session resume preserve linked hydration a
   const workerMarker = resolve(tempRoot, "worker-started.txt");
   await mkdir(resolve(cwd, ".pi"), { recursive: true });
   await mkdir(sessionDir, { recursive: true });
-  await writeFile(resolve(cwd, ".pi/settings.json"), JSON.stringify({ compaction: { keepRecentTokens: 0 } }));
+  await writeFile(resolve(cwd, ".pi/settings.json"), JSON.stringify({ compaction: { keepRecentTokens: 0, reserveTokens: 16_384 } }));
   await writeFile(observerExtension, contextObserverSource(contextEvidenceFile, cancelCompactionFile, compactionEvidenceFile));
   await writeFile(workerShim, `#!/bin/sh\nprintf '%s\\n' started >> "$${workerMarkerVariable}"\nprintf '%s\\n' 'not-a-valid-laya-response'\n`);
   await chmod(workerShim, 0o700);
@@ -243,7 +249,7 @@ test("real native compaction and same-session resume preserve linked hydration a
   const resolvedPiExecutable = await realpath(piExecutable);
   const piRoot = resolve(dirname(resolvedPiExecutable), "../..");
   const metadata = JSON.parse(await readFile(resolve(piRoot, "package.json"), "utf8")) as { version?: unknown };
-  assert.equal(metadata.version, "0.87.1", "the harness requires the installed Pi 0.87.1 RPC contract");
+  assert.equal(metadata.version, "1.0.2", "the native lifecycle harness targets the owner-approved Pi 1.0.2 runtime");
   const { SessionManager } = await import(pathToFileURL(resolve(piRoot, "dist/core/session-manager.js")).href);
   const seed = SessionManager.create(cwd, sessionDir);
   const sessionFile = seed.getSessionFile();
@@ -251,7 +257,7 @@ test("real native compaction and same-session resume preserve linked hydration a
   const sessionRoot = await realpath(sessionDir);
 
   const syntheticRawText = "Synthetic source datum: asterism 7 indicates the quartz key is cobalt blue.";
-  const filler = "Synthetic compaction filler, containing no user data. ".repeat(24);
+  const filler = "Synthetic compaction filler, containing no user data. ".repeat(500);
   for (let turn = 0; turn < 3; turn += 1) {
     seed.appendMessage({ role: "user", content: [{ type: "text", text: `Synthetic setup turn ${turn}: ${filler}` }], timestamp: Date.now() });
     seed.appendMessage(syntheticAssistant(`Synthetic acknowledgement for setup turn ${turn}.`, Date.now()));
@@ -272,7 +278,7 @@ test("real native compaction and same-session resume preserve linked hydration a
     text: "One synthetic support link is unavailable.",
     supportingObservationIds: [missingObservationId],
   });
-  seed.appendMessage(syntheticAssistant("Synthetic session is ready for native compaction.", Date.now()));
+  seed.appendMessage(syntheticAssistant("Synthetic session is ready for native compaction.", Date.now(), 24_000));
 
   const canonicalSessionFile = await realpath(sessionFile);
   assertContained(canonicalSessionFile, sessionRoot, "fresh session file must be inside the disposable session directory before any prompt");
@@ -286,19 +292,43 @@ test("real native compaction and same-session resume preserve linked hydration a
   assert.ok(initialBranchIds.includes(partialReflectionId), "partial-link reflection must be on the seeded active branch");
 
   rpc = new PiRpc(piExecutable, cwd, sessionDir, canonicalSessionFile, observerExtension);
+  const probeState = await rpc.command({ type: "get_state" });
+  assert.equal(probeState.success, true, "Pi RPC must open the fresh synthetic session");
+  assert.ok(isRecord(probeState.data), "Pi RPC state must be present");
+  assert.equal(probeState.data.sessionId, sessionId, "spawned Pi must open the seeded session ID");
+  assert.equal(typeof probeState.data.sessionFile, "string", "spawned Pi must expose its exact session file");
+  const probeSessionFile = await realpath(resolve(cwd, probeState.data.sessionFile));
+  assert.equal(probeSessionFile, canonicalSessionFile, "spawned Pi must open the exact seeded file before any prompt/provider operation");
+  assertContained(probeSessionFile, sessionRoot, "spawned Pi session must remain inside the fresh disposable directory");
+  assert.ok(isRecord(probeState.data.model), "a configured Pi model must be available for real native compaction");
+  const testModel = smallContextModel(probeState.data.model);
+  const requestedModel = process.env.PI_SESSION_MEMORY_E01_MODEL;
+  if (requestedModel) {
+    assert.equal(`${testModel.provider}/${testModel.definition.id}`, requestedModel, "Pi must use the explicitly requested provider and model");
+  }
+  t.diagnostic(`Native test model: ${testModel.provider}/${testModel.definition.id}; thinking: ${process.env.PI_SESSION_MEMORY_E01_THINKING ?? "off"}`);
+  assert.equal(rpc.confirmationRequests.length, 0, "model discovery must not request memory generation consent");
+  await rpc.stop();
+  rpc = undefined;
+
+  await writeFile(observerExtension, contextObserverSource(contextEvidenceFile, cancelCompactionFile, compactionEvidenceFile, testModel));
+  rpc = new PiRpc(piExecutable, cwd, sessionDir, canonicalSessionFile, observerExtension);
   const initialState = await rpc.command({ type: "get_state" });
-  assert.equal(initialState.success, true, "Pi RPC must open the fresh synthetic session");
-  assert.ok(isRecord(initialState.data), "Pi RPC state must be present");
-  assert.equal(initialState.data.sessionId, sessionId, "spawned Pi must open the seeded session ID");
-  assert.equal(typeof initialState.data.sessionFile, "string", "spawned Pi must expose its exact session file");
+  assert.equal(initialState.success, true, "Pi RPC must reopen the fresh synthetic session with its test-only small-context model");
+  assert.ok(isRecord(initialState.data));
+  assert.equal(initialState.data.sessionId, sessionId, "small-context test runtime must preserve the seeded session ID");
+  assert.equal(typeof initialState.data.sessionFile, "string");
   const firstSessionFile = await realpath(resolve(cwd, initialState.data.sessionFile));
-  assert.equal(firstSessionFile, canonicalSessionFile, "spawned Pi must open the exact seeded file before any prompt/provider operation");
-  assertContained(firstSessionFile, sessionRoot, "spawned Pi session must remain inside the fresh disposable directory");
-  assert.ok(isRecord(initialState.data.model), "a configured Pi model must be available for real native compaction");
-  assert.equal(typeof initialState.data.model.provider, "string", "configured provider identity must be available");
+  assert.equal(firstSessionFile, canonicalSessionFile, "small-context runtime must open the exact seeded file before any prompt/provider operation");
+  assertContained(firstSessionFile, sessionRoot, "small-context runtime session must remain inside the fresh disposable directory");
+  assert.ok(isRecord(initialState.data.model));
+  assert.equal(initialState.data.model.provider, testModel.provider, "test-only model registration must preserve the configured provider and its authentication");
+  assert.equal(initialState.data.model.id, testModel.definition.id, "test-only model registration must preserve the configured model identity");
+  assert.equal(initialState.data.model.contextWindow, 32_768, "native Pi must use the deliberately small test context window");
+  assert.equal(initialState.data.autoCompactionEnabled, true, "auto-compaction must remain enabled for the threshold test");
   assert.equal(rpc.confirmationRequests.length, 0, "memory generation consent must not be requested by this test");
 
-  const firstCompaction = await runNativeCompaction(rpc);
+  const firstCompaction = await runAutomaticCompaction(rpc);
   await rpc.stop();
   rpc = undefined;
 
@@ -497,28 +527,83 @@ async function runNativeCompaction(rpc: Pick<PiRpc, "cursor" | "command" | "wait
   return { nativeRpcSucceeded: true, aborted: false, summaryCharacters: compactEvent.result.summary.length };
 }
 
+async function runAutomaticCompaction(rpc: Pick<PiRpc, "cursor" | "command" | "waitForEvent">): Promise<{ automaticThresholdTriggered: true; nativeRpcSucceeded: true; aborted: false; summaryCharacters: number }> {
+  const cursor = rpc.cursor();
+  const response = await rpc.command({
+    type: "prompt",
+    message: "Synthetic low-context compaction trigger: reply exactly 'synthetic auto-compaction complete'. No prior session details are needed.",
+  });
+  assert.equal(response.success, true, "Pi RPC must accept a prompt that crosses the synthetic low-context threshold");
+  const start = await rpc.waitForEvent(cursor, (event) => event.type === "compaction_start", 180_000);
+  assert.equal(start.reason, "threshold", "the small test context must trigger automatic threshold compaction, not manual compaction");
+  const end = await rpc.waitForEvent(cursor, (event) => event.type === "compaction_end", 180_000);
+  assert.equal(end.reason, "threshold", "successful compaction must retain its automatic threshold reason");
+  assert.equal(end.aborted, false, "automatic native compaction must not be cancelled");
+  assert.ok(isRecord(end.result), "successful automatic compaction must include its result");
+  assert.equal(typeof end.result.summary, "string");
+  assert.ok(end.result.summary.length > 0, "automatic native compaction must produce a summary");
+  await rpc.waitForEvent(cursor, (event) => event.type === "agent_settled");
+  return {
+    automaticThresholdTriggered: true,
+    nativeRpcSucceeded: true,
+    aborted: false,
+    summaryCharacters: end.result.summary.length,
+  };
+}
+
 function assertSameSessionResume(expected: { sessionId: unknown; sessionFile: unknown; branchEntryIds: unknown }, actual: { sessionId: unknown; sessionFile: unknown; branchEntryIds: unknown }): void {
   assert.equal(actual.sessionId, expected.sessionId, "resumed Pi session ID must exactly match the pre-compaction identity");
   assert.equal(actual.sessionFile, expected.sessionFile, "resume must open the exact same persisted session file");
   assert.deepEqual(actual.branchEntryIds, expected.branchEntryIds, "resumed active branch must exactly match the compacted branch");
 }
 
-function syntheticAssistant(text: string, timestamp: number) {
+function syntheticAssistant(text: string, timestamp: number, contextTokens = 1) {
   return {
     role: "assistant",
     content: [{ type: "text", text }],
     api: "openai-completions",
     provider: "e01-synthetic-fixture",
     model: "synthetic-fixture",
-    usage: { input: 0, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 1 },
+    usage: { input: Math.max(0, contextTokens - 1), output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: contextTokens },
     stopReason: "stop",
     timestamp,
   };
 }
 
-function contextObserverSource(evidenceFile: string, cancelCompactionFile: string, compactionEvidenceFile: string): string {
+function smallContextModel(model: RpcRecord): SmallContextModelRegistration {
+  assert.equal(typeof model.provider, "string");
+  assert.equal(typeof model.id, "string");
+  assert.equal(typeof model.name, "string");
+  assert.equal(typeof model.api, "string");
+  assert.equal(typeof model.baseUrl, "string");
+  assert.equal(typeof model.reasoning, "boolean");
+  assert.ok(Array.isArray(model.input));
+  assert.ok(isRecord(model.cost));
+  assert.equal(typeof model.maxTokens, "number");
+  const definition: RpcRecord = {
+    id: model.id,
+    name: `${model.name} (32k synthetic compaction test)`,
+    api: model.api,
+    baseUrl: model.baseUrl,
+    reasoning: model.reasoning,
+    input: model.input,
+    cost: model.cost,
+    contextWindow: 32_768,
+    maxTokens: Math.min(model.maxTokens, 4_096),
+  };
+  for (const key of ["thinkingLevelMap", "inputLimits", "promptCache", "samplingParams", "samplingParamsByThinkingLevel", "compat"]) {
+    if (model[key] !== undefined) definition[key] = model[key];
+  }
+  return { provider: model.provider, definition };
+}
+
+function contextObserverSource(evidenceFile: string, cancelCompactionFile: string, compactionEvidenceFile: string, testModel?: SmallContextModelRegistration): string {
+  const registerSmallContextModel = testModel
+    ? `  pi.registerProvider(${JSON.stringify(testModel.provider)}, { models: [${JSON.stringify(testModel.definition)}] });\n`
+    : "";
   return `import { appendFileSync, existsSync } from "node:fs";
 export default function (pi) {
+${registerSmallContextModel}
   pi.on("context", (event) => {
     const projectionPresent = event.messages.some((message) => {
       if (typeof message.content === "string") return message.content.includes(${JSON.stringify(projectionLabel)});
