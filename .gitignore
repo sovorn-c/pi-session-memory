@@ -15,3 +15,7 @@ graphify-out/
 .env
 .env.*
 !.env.example
+scripts/
+test/scripts/
+worker/quality_checkpoint.py
+worker/tests/fixtures/*labeled-memory-questions.jsonl

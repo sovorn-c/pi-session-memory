@@ -7,27 +7,28 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { test } from "node:test";
+import { layaTestEnv } from "../support/laya-env.ts";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
-const realPiOptIn = process.env.PI_SESSION_MEMORY_E01_REAL_PI === "1";
-const workerMarkerVariable = "PI_SESSION_MEMORY_E01_WORKER_MARKER";
+const laya = layaTestEnv();
+const realPiOptIn = process.env.PI_SESSION_MEMORY_REAL_PI_TEST === "1";
+const workerMarkerVariable = "PI_SESSION_MEMORY_WORKER_MARKER";
 const projectionLabel = "Relevant prior session memory";
-const missingObservationId = "e01s04-missing-observation-not-on-active-branch";
-const pinnedPythonDefault = "/Users/sovorn/.cache/pi-session-memory/bp-init-laya-010bacef/bin/python";
-const E03_CONTINUATION_TASK_PROMPT =
+const missingObservationId = "session-missing-observation-not-on-active-branch";
+const CONTINUATION_CONTINUATION_TASK_PROMPT =
   "Continue the earlier branch-lookup fix. Identify the smallest change, give its patch and explain why the rejected global lookup approach is wrong. Use the project and earlier evidence if needed; do not modify files.";
-const E03_PRELABELED_ORACLE = {
+const CONTINUATION_PRELABELED_ORACLE = {
   expectedFix:
     "The smallest change keeps append-only active-branch lookup in the session manager rather than replacing canonical Pi history with a global or external store.",
   rejectedApproach:
     "A global or external lookup store that replaces canonical Pi session history and bypasses active-branch provenance.",
   preservedConstraint: "Canonical Pi session history stays append-only with exact active-branch source links.",
 };
-const E03_MAX_PROVIDER_STARTS = 9;
-const E03_ARM_DEADLINE_MS = 300_000;
-const E03_TRIAL_DEADLINE_MS = 900_000;
-const E03_MAX_INFERENCES_PER_ARM = 4;
-const E03_RECORDER_ALLOWED_LOG_KEYS = new Set([
+const CONTINUATION_MAX_PROVIDER_STARTS = 9;
+const CONTINUATION_ARM_DEADLINE_MS = 300_000;
+const CONTINUATION_TRIAL_DEADLINE_MS = 900_000;
+const CONTINUATION_MAX_INFERENCES_PER_ARM = 4;
+const CONTINUATION_RECORDER_ALLOWED_LOG_KEYS = new Set([
   "gate",
   "request_id",
   "candidate_ids",
@@ -123,9 +124,9 @@ class PiRpc {
       "--session", sessionFile,
       "--tools", launch.tools ?? "hydrate_session_memory",
       ...(launch.excludeTools ? ["--exclude-tools", launch.excludeTools] : []),
-      "--system-prompt", launch.systemPrompt ?? "Synthetic e01 integration only. Use only the supplied synthetic session entries.",
-      ...(process.env.PI_SESSION_MEMORY_E01_MODEL ? ["--model", process.env.PI_SESSION_MEMORY_E01_MODEL] : []),
-      "--thinking", process.env.PI_SESSION_MEMORY_E01_THINKING ?? "off",
+      "--system-prompt", launch.systemPrompt ?? "Synthetic session integration only. Use only the supplied synthetic session entries.",
+      ...(process.env.PI_SESSION_MEMORY_TEST_MODEL ? ["--model", process.env.PI_SESSION_MEMORY_TEST_MODEL] : []),
+      "--thinking", process.env.PI_SESSION_MEMORY_TEST_THINKING ?? "off",
       "--approve",
       "--no-context-files",
       "--no-skills",
@@ -168,7 +169,7 @@ class PiRpc {
 
   command(command: RpcRecord, timeoutMs = 300_000): Promise<RpcRecord> {
     if (this.protocolFailure) return Promise.reject(this.protocolFailure);
-    const id = `e01s04-${++this.counter}`;
+    const id = `session-${++this.counter}`;
     return new Promise((resolveResponse, rejectResponse) => {
       const timer = setTimeout(() => {
         this.responses.delete(id);
@@ -281,12 +282,12 @@ class PiRpc {
 
 test("Pi 1.0.2 low-context auto-compaction and same-session resume preserve linked hydration and fail native on worker uncertainty", {
   timeout: 900_000,
-  skip: realPiOptIn ? false : "Set PI_SESSION_MEMORY_E01_REAL_PI=1 to opt into disposable synthetic provider calls; skipped means zero Pi/provider calls.",
+  skip: realPiOptIn ? false : "Set PI_SESSION_MEMORY_REAL_PI_TEST=1 to opt into disposable synthetic provider calls; skipped means zero Pi/provider calls.",
 }, async (t) => {
-  assert.equal(process.env.PI_SESSION_MEMORY_E01_REAL_PI, "1", "provider-backed compaction requires explicit test opt-in");
+  assert.equal(process.env.PI_SESSION_MEMORY_REAL_PI_TEST, "1", "provider-backed compaction requires explicit test opt-in");
   t.diagnostic("Provider disclosure: after validating a fresh temporary session path, this test sends only synthetic session content to the configured Pi provider. It overrides contextWindow/maxTokens only in the disposable Pi process to exercise 32k threshold auto-compaction, then tests same-session resume, hydration-tool interaction, native compaction, and cancellation; memory generation is not enabled.");
 
-  const tempRoot = await mkdtemp(resolve(tmpdir(), "pi-session-memory-e01s04-"));
+  const tempRoot = await mkdtemp(resolve(tmpdir(), "pi-session-memory-session-"));
   let rpc: PiRpc | undefined;
   t.after(async () => {
     if (rpc) await rpc.stop();
@@ -365,11 +366,11 @@ test("Pi 1.0.2 low-context auto-compaction and same-session resume preserve link
   assertContained(probeSessionFile, sessionRoot, "spawned Pi session must remain inside the fresh disposable directory");
   assert.ok(isRecord(probeState.data.model), "a configured Pi model must be available for real native compaction");
   const testModel = smallContextModel(probeState.data.model);
-  const requestedModel = process.env.PI_SESSION_MEMORY_E01_MODEL;
+  const requestedModel = process.env.PI_SESSION_MEMORY_TEST_MODEL;
   if (requestedModel) {
     assert.equal(`${testModel.provider}/${testModel.definition.id}`, requestedModel, "Pi must use the explicitly requested provider and model");
   }
-  t.diagnostic(`Native test model: ${testModel.provider}/${testModel.definition.id}; thinking: ${process.env.PI_SESSION_MEMORY_E01_THINKING ?? "off"}`);
+  t.diagnostic(`Native test model: ${testModel.provider}/${testModel.definition.id}; thinking: ${process.env.PI_SESSION_MEMORY_TEST_THINKING ?? "off"}`);
   assert.equal(rpc.confirmationRequests.length, 0, "model discovery must not request memory generation consent");
   await rpc.stop();
   rpc = undefined;
@@ -504,7 +505,7 @@ test("Pi 1.0.2 low-context auto-compaction and same-session resume preserve link
     initialEntries.filter(isMemoryEntry),
     "the extension generation path must stay disabled and synthetic semantic entries must remain append-only",
   );
-  t.diagnostic(`E01 real-Pi evidence: ${JSON.stringify({
+  t.diagnostic(`real-Pi evidence: ${JSON.stringify({
     sessionId,
     sessionFile: canonicalSessionFile,
     resumedSameSessionAndFile: resumedState.data.sessionId === sessionId && resumedSessionFile === canonicalSessionFile,
@@ -618,11 +619,11 @@ class E03ProviderBudget {
   private readonly maxPerArm: number;
 
   constructor(
-    maxStarts = E03_MAX_PROVIDER_STARTS,
+    maxStarts = CONTINUATION_MAX_PROVIDER_STARTS,
     trialStartedAt = Date.now(),
-    trialDeadlineMs = E03_TRIAL_DEADLINE_MS,
-    armDeadlineMs = E03_ARM_DEADLINE_MS,
-    maxPerArm = E03_MAX_INFERENCES_PER_ARM,
+    trialDeadlineMs = CONTINUATION_TRIAL_DEADLINE_MS,
+    armDeadlineMs = CONTINUATION_ARM_DEADLINE_MS,
+    maxPerArm = CONTINUATION_MAX_INFERENCES_PER_ARM,
   ) {
     this.maxStarts = maxStarts;
     this.trialStartedAt = trialStartedAt;
@@ -632,12 +633,12 @@ class E03ProviderBudget {
   }
 
   recordInferenceStart(arm: string): void {
-    assert.ok(Date.now() - this.trialStartedAt <= this.trialDeadlineMs, "E03 trial exceeded whole-trial deadline");
+    assert.ok(Date.now() - this.trialStartedAt <= this.trialDeadlineMs, "Continuation trial exceeded whole-trial deadline");
     this.starts += 1;
-    assert.ok(this.starts <= this.maxStarts, "E03 trial exceeded provider inference start budget");
+    assert.ok(this.starts <= this.maxStarts, "Continuation trial exceeded provider inference start budget");
     const next = (this.armStarts.get(arm) ?? 0) + 1;
     this.armStarts.set(arm, next);
-    assert.ok(next <= this.maxPerArm, `E03 arm ${arm} exceeded per-arm inference budget`);
+    assert.ok(next <= this.maxPerArm, `Continuation arm ${arm} exceeded per-arm inference budget`);
   }
 
   inferenceStartCount(): number {
@@ -645,7 +646,7 @@ class E03ProviderBudget {
   }
 
   assertArmWallDeadline(arm: string, armStartedAt: number): void {
-    assert.ok(Date.now() - armStartedAt <= this.armDeadlineMs, `E03 arm ${arm} exceeded arm deadline`);
+    assert.ok(Date.now() - armStartedAt <= this.armDeadlineMs, `Continuation arm ${arm} exceeded arm deadline`);
   }
 }
 
@@ -690,7 +691,7 @@ function resolveE03ContinuationOutcome(nativeCorrect: boolean, memoryCorrect: bo
 function assertBoundedRecorderLogEntry(entry: unknown): void {
   assert.ok(isRecord(entry));
   for (const key of Object.keys(entry)) {
-    assert.ok(E03_RECORDER_ALLOWED_LOG_KEYS.has(key), `recorder log must not include field ${key}`);
+    assert.ok(CONTINUATION_RECORDER_ALLOWED_LOG_KEYS.has(key), `recorder log must not include field ${key}`);
   }
   assert.equal(typeof entry.state_bytes, "number");
   assert.ok(entry.state_bytes >= 0);
@@ -810,7 +811,7 @@ function e03TrialObserverSource(evidenceFile: string, testModel?: SmallContextMo
 export default function (pi) {
 ${registerSmallContextModel}
   pi.on("agent_end", () => {
-    appendFileSync(${JSON.stringify(evidenceFile)}, JSON.stringify({ kind: "inference_start", arm: process.env.PI_SESSION_MEMORY_E03_ARM ?? "unknown" }) + "\\n");
+    appendFileSync(${JSON.stringify(evidenceFile)}, JSON.stringify({ kind: "inference_start", arm: process.env.PI_SESSION_MEMORY_TEST_ARM ?? "unknown" }) + "\\n");
   });
 }
 `;
@@ -909,15 +910,15 @@ async function runE03ContinuationArm(options: {
   const armStartedAt = Date.now();
   const rpc = new PiRpc(options.piExecutable, options.cwd, options.sessionDir, options.sessionFile, options.observerExtension, {
     ...options.launch,
-    env: { PI_SESSION_MEMORY_E03_ARM: options.arm, ...(options.launch.env ?? {}) },
+    env: { PI_SESSION_MEMORY_TEST_ARM: options.arm, ...(options.launch.env ?? {}) },
   });
   try {
     const state = await rpc.command({ type: "get_state" });
     assert.equal(state.success, true);
     const cursor = rpc.cursor();
-    const prompt = await rpc.command({ type: "prompt", message: E03_CONTINUATION_TASK_PROMPT }, E03_ARM_DEADLINE_MS);
+    const prompt = await rpc.command({ type: "prompt", message: CONTINUATION_CONTINUATION_TASK_PROMPT }, CONTINUATION_ARM_DEADLINE_MS);
     assert.equal(prompt.success, true, `${options.arm} continuation prompt must succeed`);
-    await rpc.waitForEvent(cursor, (event) => event.type === "agent_settled", E03_ARM_DEADLINE_MS);
+    await rpc.waitForEvent(cursor, (event) => event.type === "agent_settled", CONTINUATION_ARM_DEADLINE_MS);
     options.budget.assertArmWallDeadline(options.arm, armStartedAt);
     const armRecords = rpc.recordsSince(cursor);
     const inferenceStarts = chargeInferenceStartsFromRpcRecords(options.budget, options.arm, armRecords);
@@ -933,7 +934,7 @@ async function runE03ContinuationArm(options: {
   }
 }
 
-test("E03 continuation compacted seed fixture equality uses matching pre-turn fingerprints", () => {
+test("Continuation compacted seed fixture equality uses matching pre-turn fingerprints", () => {
   const sharedSeed = [
     { type: "message", id: "raw-decision-lookup", message: { role: "user", content: [{ type: "text", text: "branch lookup decision" }] } },
     { type: "custom", id: "observation-branch-lookup", customType: "pi-session-memory.observation" },
@@ -946,7 +947,7 @@ test("E03 continuation compacted seed fixture equality uses matching pre-turn fi
   assert.throws(() => assertE03CompactedSeedEquality(nativeCopy, memoryCopy), /compacted arm seeds must match/);
 });
 
-test("E03 continuation result oracle scores the predeclared active-branch patch criteria", () => {
+test("Continuation result oracle scores the predeclared active-branch patch criteria", () => {
   tDiagnosticOraclePrelabel();
   const allowedIds = ["observation-branch-lookup", "raw-decision-lookup"];
   const good = `
@@ -961,13 +962,13 @@ A global external store is wrong because it replaces canonical Pi history and br
   assert.equal(badScore.rejectsGlobalStoreApproach, false);
 });
 
-test("E03 continuation trial guard reports BLOCKED_NO_CONSENT without operator opt-in", () => {
+test("Continuation trial guard reports BLOCKED_NO_CONSENT without operator opt-in", () => {
   const gate = evaluateE03TrialReadiness({});
   assert.equal(gate.status, "blocked");
   if (gate.status === "blocked") assert.equal(gate.reason, "BLOCKED_NO_CONSENT");
 });
 
-test("E03 continuation trial guard reports blocked reason when model or thinking is missing", () => {
+test("Continuation trial guard reports blocked reason when model or thinking is missing", () => {
   const missingModel = evaluateE03TrialReadiness({ providerTrial: "1", model: "", thinking: "high" });
   assert.equal(missingModel.status, "blocked");
   if (missingModel.status === "blocked") assert.equal(missingModel.reason, "BLOCKED_MISSING_MODEL");
@@ -976,7 +977,7 @@ test("E03 continuation trial guard reports blocked reason when model or thinking
   if (missingThinking.status === "blocked") assert.equal(missingThinking.reason, "BLOCKED_MISSING_THINKING");
 });
 
-test("E03 continuation provider budget charges one inference start per assistant message_end with usage", () => {
+test("Continuation provider budget charges one inference start per assistant message_end with usage", () => {
   const budget = new E03ProviderBudget(9, Date.now(), 900_000, 300_000, 10);
   const records: RpcRecord[] = [];
   for (let index = 0; index < 4; index += 1) {
@@ -995,7 +996,7 @@ test("E03 continuation provider budget charges one inference start per assistant
   assert.throws(() => budget.recordInferenceStart("native"), /provider inference start budget/);
 });
 
-test("E03 continuation provider budget and arm deadlines enforce trial caps", () => {
+test("Continuation provider budget and arm deadlines enforce trial caps", () => {
   const budget = new E03ProviderBudget(9, Date.now(), 900_000, 300_000, 4);
   for (let index = 0; index < 4; index += 1) budget.recordInferenceStart("native");
   for (let index = 0; index < 4; index += 1) budget.recordInferenceStart("memory");
@@ -1007,22 +1008,22 @@ test("E03 continuation provider budget and arm deadlines enforce trial caps", ()
   assert.throws(() => armBudget.assertArmWallDeadline("native", Date.now() - 301_000), /arm deadline/);
 });
 
-test("E03 continuation arms isolate generated responses and resident state", () => {
+test("Continuation arms isolate generated responses and resident state", () => {
   const isolation = new E03ArmIsolationRegistry();
-  isolation.registerResponse("native", "/tmp/e03/native/session.jsonl");
-  isolation.registerResponse("memory", "/tmp/e03/memory/session.jsonl");
+  isolation.registerResponse("native", "/tmp/continuation/native/session.jsonl");
+  isolation.registerResponse("memory", "/tmp/continuation/memory/session.jsonl");
   isolation.setResidentState("native", "shared-resident-key");
   isolation.setResidentState("memory", "memory-only-resident");
-  assert.throws(() => isolation.registerResponse("memory", "/tmp/e03/native/session.jsonl"), /must not share generated responses/);
+  assert.throws(() => isolation.registerResponse("memory", "/tmp/continuation/native/session.jsonl"), /must not share generated responses/);
   assert.throws(() => isolation.setResidentState("memory", "shared-resident-key"), /must not share resident state/);
 });
 
-test("E03 transparent worker recorder logs bounded fields without raw state text", async (t) => {
-  const tempDir = await mkdtemp(resolve(tmpdir(), "pi-session-memory-e03-recorder-"));
+test("Continuation transparent worker recorder logs bounded fields without raw state text", async (t) => {
+  const tempDir = await mkdtemp(resolve(tmpdir(), "pi-session-memory-recorder-"));
   t.after(async () => rm(tempDir, { recursive: true, force: true }));
   const scriptPath = resolve(tempDir, "worker-recorder.py");
   const logPath = resolve(tempDir, "worker-recorder.jsonl");
-  await writeTransparentWorkerRecorderScript(scriptPath, logPath, pinnedPythonDefault);
+  await writeTransparentWorkerRecorderScript(scriptPath, logPath, process.execPath);
   const sample = {
     gate: "projection",
     request_id: "req-1",
@@ -1036,25 +1037,25 @@ test("E03 transparent worker recorder logs bounded fields without raw state text
   assert.throws(() => assertBoundedRecorderLogEntry({ ...sample, state: "secret raw state" }), /must not include field state/);
 });
 
-test("E03 paired coding continuation trial", {
-  timeout: E03_TRIAL_DEADLINE_MS,
+test("Continuation paired coding continuation trial", {
+  timeout: CONTINUATION_TRIAL_DEADLINE_MS,
   skip: (() => {
     const gate = evaluateE03TrialReadiness({
-      providerTrial: process.env.PI_SESSION_MEMORY_E03_PROVIDER_TRIAL,
-      model: process.env.PI_SESSION_MEMORY_E01_MODEL,
-      thinking: process.env.PI_SESSION_MEMORY_E01_THINKING,
+      providerTrial: process.env.PI_SESSION_MEMORY_PROVIDER_TRIAL,
+      model: process.env.PI_SESSION_MEMORY_TEST_MODEL,
+      thinking: process.env.PI_SESSION_MEMORY_TEST_THINKING,
     });
     if (gate.status === "ready") return false;
     return `${gate.reason}; skipped means zero provider calls for this real pair`;
   })(),
 }, async (t) => {
   tDiagnosticOraclePrelabel();
-  assert.equal(process.env.PI_SESSION_MEMORY_E03_PROVIDER_TRIAL, "1");
-  assert.ok(process.env.PI_SESSION_MEMORY_E01_MODEL?.trim());
-  assert.ok(process.env.PI_SESSION_MEMORY_E01_THINKING?.trim());
-  t.diagnostic(`E03 prelabeled oracle: ${JSON.stringify(E03_PRELABELED_ORACLE)}`);
+  assert.equal(process.env.PI_SESSION_MEMORY_PROVIDER_TRIAL, "1");
+  assert.ok(process.env.PI_SESSION_MEMORY_TEST_MODEL?.trim());
+  assert.ok(process.env.PI_SESSION_MEMORY_TEST_THINKING?.trim());
+  t.diagnostic(`Continuation prelabeled oracle: ${JSON.stringify(CONTINUATION_PRELABELED_ORACLE)}`);
 
-  const tempRoot = await mkdtemp(resolve(tmpdir(), "pi-session-memory-e03-trial-"));
+  const tempRoot = await mkdtemp(resolve(tmpdir(), "pi-session-memory-trial-"));
   t.after(async () => rm(tempRoot, { recursive: true, force: true }));
 
   const cwd = resolve(tempRoot, "project");
@@ -1064,7 +1065,7 @@ test("E03 paired coding continuation trial", {
   const inferenceEvidenceFile = resolve(tempRoot, "inference-evidence.jsonl");
   const recorderLogPath = resolve(tempRoot, "worker-recorder.jsonl");
   const recorderScriptPath = resolve(tempRoot, "worker-recorder.py");
-  const observerExtension = resolve(tempRoot, "e03-observer.mjs");
+  const observerExtension = resolve(tempRoot, "continuation-observer.mjs");
   await mkdir(resolve(cwd, ".pi"), { recursive: true });
   await mkdir(sessionDir, { recursive: true });
   await writeFile(resolve(cwd, ".pi/settings.json"), JSON.stringify({ compaction: { keepRecentTokens: 0, reserveTokens: 16_384 } }));
@@ -1087,7 +1088,7 @@ test("E03 paired coding continuation trial", {
     includeMemoryExtension: false,
     tools: "read,grep",
     excludeTools: "bash,write,edit",
-    systemPrompt: "Synthetic E03 continuation trial. Read-only tools only.",
+    systemPrompt: "Synthetic Continuation trial. Read-only tools only.",
   });
   const probeState = await rpc.command({ type: "get_state" });
   assert.equal(probeState.success, true);
@@ -1102,7 +1103,7 @@ test("E03 paired coding continuation trial", {
     includeMemoryExtension: false,
     tools: "read,grep",
     excludeTools: "bash,write,edit",
-    systemPrompt: "Synthetic E03 continuation trial. Read-only tools only.",
+    systemPrompt: "Synthetic Continuation trial. Read-only tools only.",
   });
   const seedCompaction = await runAutomaticCompaction(rpc);
   await rpc.stop();
@@ -1115,19 +1116,16 @@ test("E03 paired coding continuation trial", {
   assertE03CompactedSeedEquality(await readSession(nativeSessionFile), await readSession(memorySessionFile));
   assertE03CompactedSeedEquality(compactedEntries, await readSession(nativeSessionFile));
 
-  const pinnedPython = process.env.PI_SESSION_MEMORY_PYTHON ?? pinnedPythonDefault;
+  const pinnedPython = laya.ready ? laya.python : "";
+  assert.ok(laya.ready, laya.ready ? "" : laya.reason);
   await writeTransparentWorkerRecorderScript(recorderScriptPath, recorderLogPath, pinnedPython);
 
   const sharedLaunchBase = {
     excludeTools: "bash,write,edit",
-    systemPrompt: "Synthetic E03 continuation trial. Read-only tools only.",
+    systemPrompt: "Synthetic Continuation trial. Read-only tools only.",
   };
   const layaEnv = {
-    HF_HOME: "/Users/sovorn/.cache/pi-session-memory/bp-init-laya-010bacef/hf",
-    HF_HUB_OFFLINE: "1",
-    TRANSFORMERS_OFFLINE: "1",
-    USE_TF: "0",
-    TOKENIZERS_PARALLELISM: "false",
+    ...(laya.ready ? laya.env : {}),
     PYTHONDONTWRITEBYTECODE: "1",
     PI_RECORDER_LOG: recorderLogPath,
   };
@@ -1200,15 +1198,10 @@ test("E03 paired coding continuation trial", {
     outcome,
     unresolvedSafetyDefects: 0,
   };
-  await mkdir(resolve(projectRoot, "specs/verifications/e03-build"), { recursive: true });
-  await writeFile(
-    resolve(projectRoot, "specs/verifications/e03-build/continuation-trial.json"),
-    `${JSON.stringify(continuationTrialArtifact, null, 2)}\n`,
-  );
-
   t.diagnostic(JSON.stringify({
-    prelabeledOracle: E03_PRELABELED_ORACLE,
-    taskPrompt: E03_CONTINUATION_TASK_PROMPT,
+    continuationTrialArtifact,
+    prelabeledOracle: CONTINUATION_PRELABELED_ORACLE,
+    taskPrompt: CONTINUATION_CONTINUATION_TASK_PROMPT,
     seedCompaction,
     native: { ...nativeResult, oracle: nativeOracle },
     memory: { ...memoryResult, oracle: memoryOracle },
@@ -1217,8 +1210,8 @@ test("E03 paired coding continuation trial", {
 });
 
 function tDiagnosticOraclePrelabel(): void {
-  assert.match(E03_PRELABELED_ORACLE.expectedFix, /session manager/);
-  assert.match(E03_PRELABELED_ORACLE.rejectedApproach, /global|external/i);
+  assert.match(CONTINUATION_PRELABELED_ORACLE.expectedFix, /session manager/);
+  assert.match(CONTINUATION_PRELABELED_ORACLE.rejectedApproach, /global|external/i);
 }
 
 function fakeCompactionRpc(response: RpcRecord, event: RpcRecord): { rpc: Pick<PiRpc, "cursor" | "command" | "waitForEvent">; commands: RpcRecord[] } {
@@ -1290,7 +1283,7 @@ function syntheticAssistant(text: string, timestamp: number, contextTokens = 1) 
     role: "assistant",
     content: [{ type: "text", text }],
     api: "openai-completions",
-    provider: "e01-synthetic-fixture",
+    provider: "synthetic-memory-fixture",
     model: "synthetic-fixture",
     usage: { input: Math.max(0, contextTokens - 1), output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: contextTokens },
     stopReason: "stop",

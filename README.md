@@ -1,242 +1,159 @@
 # pi-session-memory
 
-Local experimental Pi extension for one session. It keeps source-linked observations and reflections in the Pi session, asks upstream Laya for bounded gates and selection, and can insert a small working set into the request Pi already sends. Pi stays usable when the extension fails.
+Session memory for [Pi](https://github.com/earendil-works/pi). It keeps a few short, source-linked notes for the coding session you have open. A local Laya model decides when a note is worth keeping and which note a later turn might need. Your configured Pi model writes the note only after you allow it for that session. If the extension or Laya fails, Pi keeps working with its normal context.
 
-This repository is not published. The pre-publication security review has not been run.
+Generation is off by default. Install it, run `/memory status`, and nothing is generated.
 
-## Prerequisites
+## Install
 
-Checked on one macOS Apple Silicon (arm64) machine, English, one Pi session:
-
-- Pi `1.0.2`
-- Node `v26.7.0`
-- Python `3.11.15` via `PI_SESSION_MEMORY_PYTHON`
-- Upstream Laya `0.3.7` at commit `010bacef009c855ccba814b51f7c8e1d38ab5e3f`
-- Checkpoint revision `f9ab0b228f0fc0f14d873dbc99038f135c2da1b2`
-- `model.safetensors` SHA-256 `4fa56de72383a9d3efa9cfa78955733c81b9fc8067a587ca4beb82c78107a24e`
-
-The default checkpoint directory is machine-specific:
-
-`~/.cache/pi-session-memory/bp-init-laya-010bacef/hf/hub/models--convaiinnovations--laya-typed-decisions/snapshots/f9ab0b228f0fc0f14d873dbc99038f135c2da1b2`
-
-`PI_SESSION_MEMORY_LAYA_CHECKPOINT` overrides that directory. Its final path component must equal the revision above.
-
-Offline cache variables used with the commands below: `HF_HOME`, `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`.
-
-## Setup
-
-From this repository, with the cache already present:
+Clone this repository, then install that directory. Pi records the path in `settings.json`. It does not copy the extension into Pi's directories, and there is no build step. The package entry is `./src/extension.ts`.
 
 ```sh
-export PATH="/opt/homebrew/bin:$PATH"
-export PI_SESSION_MEMORY_PYTHON="$HOME/.cache/pi-session-memory/bp-init-laya-010bacef/bin/python"
-export PYTHONDONTWRITEBYTECODE=1
-export PI_OFFLINE=1
-export PI_SKIP_VERSION_CHECK=1
-export PI_TELEMETRY=0
-export HF_HOME="$HOME/.cache/pi-session-memory/bp-init-laya-010bacef/hf"
-export HF_HUB_OFFLINE=1
-export TRANSFORMERS_OFFLINE=1
-export USE_TF=0
-export TOKENIZERS_PARALLELISM=false
-test -x "$PI_SESSION_MEMORY_PYTHON"
-test -r "$HF_HOME/hub/models--convaiinnovations--laya-typed-decisions/snapshots/f9ab0b228f0fc0f14d873dbc99038f135c2da1b2/model.safetensors"
-shasum -a 256 "$HF_HOME/hub/models--convaiinnovations--laya-typed-decisions/snapshots/f9ab0b228f0fc0f14d873dbc99038f135c2da1b2/model.safetensors"
+pi install /path/to/pi-session-memory
 ```
 
-Compare the digest to the hash above. No checkpoint download command is recorded: the cached snapshot has no `refs` directory. The cache must already contain that snapshot.
-
-## Load
-
-The `e01-*` prefix is historical. Two routes:
+To load it for a single run instead:
 
 ```sh
-pi --extension "$PWD/src/extension.ts" --help
+pi -e /path/to/pi-session-memory/src/extension.ts
 ```
 
-Persistent use writes an absolute path into `<agent>/settings.json` (`PI_CODING_AGENT_DIR`, default `~/.pi/agent`):
+After install, start Pi and run `/memory`. You should see a status block: generation, config path, Python command, and token cadence.
+
+## Requirements
+
+You need Pi and Python 3.11. This tree was checked on macOS arm64 with Pi 1.0.2, Node v26.7.0, and Python 3.11.15.
+
+Laya is 0.3.7 at commit `010bacef009c855ccba814b51f7c8e1d38ab5e3f`. The checkpoint revision is `f9ab0b228f0fc0f14d873dbc99038f135c2da1b2`. The `model.safetensors` SHA-256 is `4fa56de72383a9d3efa9cfa78955733c81b9fc8067a587ca4beb82c78107a24e`.
+
+## Configure
+
+Optional. With no config file, generation stays off and the other defaults below apply.
+
+The file is `<Pi agent dir>/pi-session-memory/config.json`. The agent directory is usually `~/.pi/agent`. `PI_CODING_AGENT_DIR` overrides it. You create the file yourself. The extension reads it when a session starts and never writes it. A missing file uses the defaults. A malformed file uses the defaults and warns once.
+
+| Key | Type | Default |
+| --- | --- | --- |
+| `generation` | boolean | `false` |
+| `python` | non-empty string, optional | `python3.11` |
+| `observeAfterTokens` | integer >= 1 | `10000` |
+| `reflectAfterTokens` | integer >= 1 | `20000` |
+
+`PI_SESSION_MEMORY_PYTHON` overrides `python`. `PI_SESSION_MEMORY_LAYA_CHECKPOINT` overrides the checkpoint directory. For the Python command, the environment variable wins, then the config value, then `python3.11`.
+
+How many notes can be considered (6, maximum 8) and how long a projected note can be (4000 characters, maximum 6000) are internal limits, not settings. Edit the file, then `/reload` or start Pi again.
+
+Example, still off until you also confirm in the session:
 
 ```json
-{ "extensions": ["/absolute/path/to/pi-session-memory/src/extension.ts"] }
+{
+  "generation": false,
+  "python": "python3.11",
+  "observeAfterTokens": 10000,
+  "reflectAfterTokens": 20000
+}
 ```
-
-Loaded Pi lists `--e01-memory-generation` (boolean, default false), `--e01-observe-after-tokens` (default `10000`), `--e01-reflect-after-tokens` (default `20000`), `--e01-memory-candidates` (default `6`, max 8), and `--e01-memory-projection-chars` (default `4000`, max 6000).
-
-Loading registers those flags. It does not start the Laya worker and it does not call a model provider. The worker starts at the first Laya gate. See [src/extension.ts](src/extension.ts).
 
 ## Use
 
-With generation left off, Pi keeps working. Stored memory stays in custom entries. Pi does not copy that text into model-visible messages.
+`/memory` with no arguments is the same as `/memory status`.
 
-When the current user text needs earlier memory, local Laya may select one candidate. That text is inserted into the request Pi was already going to send. See [src/projection.ts](src/projection.ts).
+`/memory status` prints whether generation is on, the config path, the Python command, and the cadence. It does not start Laya and does not call your model.
 
-The model can call `hydrate_session_memory` for a reflection, its observation, or the exact linked raw entries. Missing links are reported and not invented. See [src/hydration.ts](src/hydration.ts).
+`/memory on` enables generation for this session only. `/memory on` is not consent. The first time this session is about to write a memory, Pi asks you to confirm. Nothing is sent until you confirm.
 
-## Disable
+`/memory off` disables generation for this session and drops a confirmation already stored for it. Neither command writes the config file or the session file.
 
-`pi --no-extensions` turns the extension off for that run even when `settings.json` lists it. Session files stay.
+A new session, a fork, a resume, or `/reload` clears that session switch. You are asked again before the next write.
 
-## Remove
+When a later request needs an earlier note, local Laya may select one. Projected memory reaches the normal Pi provider inside the request Pi was already going to send. The model can call `hydrate_session_memory` to read a reflection, the observation it came from, or the exact linked raw entries. A missing link is reported. A replacement is not invented.
 
-Delete the extension path from `settings.json`. Leave session files, this clone, the Python environment, and the checkpoint cache in place. A following `pi --help` lists no `--e01-*` flags.
+## Disable and remove
 
-```sh
-pi --help
-```
+`/memory off` turns generation off for the current session. The extension stays loaded.
 
-## Provisioning (recorded, not re-run by this project)
-
-These two commands are how the local environment was created. They are not re-run by this project, and they are not a from-scratch installer:
+`pi --no-extensions` disables every extension for that run, including this one if you installed it.
 
 ```sh
-uv venv --python python3.11 '<env>'
-uv pip install --python '<env>/bin/python' '<local Laya checkout at 010bacef009c855ccba814b51f7c8e1d38ab5e3f>'
+pi remove /path/to/pi-session-memory
 ```
 
-The checkout is upstream Laya at that commit: https://github.com/NandhaKishorM/laya
+Remove drops the package path from `settings.json`. Your session files and any Laya cache stay where they are.
 
-Point `PI_SESSION_MEMORY_PYTHON` at `'<env>/bin/python'`. Check the snapshot with the `shasum` command in Setup. Do not invent a download.
+## What gets sent
 
-## Data flow and provider opt-in
+Generation is off by default. A write needs both a switch and an interactive confirmation: `generation: true` in the config, or `/memory on`, and then your answer for that session. `/memory on` is not consent. Pi shows this question:
 
-The Pi session stays canonical and local. The extension appends non-context custom entries only when generation is enabled. Laya runs locally in a Python subprocess over JSONL and only gates or selects. It does not write memory text.
+> Session-derived text and its source entry IDs will be sent to the currently configured Pi model/provider only after a local Laya gate accepts. Laya runs locally. The Pi session remains canonical; generated memories are appended as non-context session entries. Do you allow this for the current session?
 
-Generation is off by default (`--e01-memory-generation` defaults to false). With generation off, this extension does not send session text to a provider.
+There is one provider call site, `modelRegistry.complete`. Decline, and that write does not happen. Projected memory reaches the normal Pi provider as part of a request Pi was already sending. `hydrate_session_memory` returns entries already in the session and does not call the provider.
 
-With `--e01-memory-generation` set, an interactive confirmation is required. The confirmation shows this disclosure before any session-derived text is sent:
+The extension runs with Pi's permissions. Behavior lives under `src/` and `worker/`. A static scan of `src/` and `worker/` finds no telemetry client and no network client. Recorded checks set `PI_OFFLINE=1`, `PI_TELEMETRY=0`, `HF_HUB_OFFLINE=1`, and `TRANSFORMERS_OFFLINE=1`.
 
-Session-derived text and its source entry IDs will be sent to the currently configured Pi model/provider only after a local Laya gate accepts. Laya runs locally. The Pi session remains canonical; generated memories are appended as non-context session entries. Do you allow this for the current session?
+## What one trial showed
 
-After you confirm, and only after the local Laya gate accepts, session-derived text and source entry IDs go to the currently configured Pi model. The extension has one provider call site, `modelRegistry.complete`.
-
-Selected memory text is inserted into the request Pi already sends to its configured model, so projected memory reaches the normal Pi provider.
-
-`hydrate_session_memory` returns session evidence to the model on demand.
-
-An extension runs inside the Pi process with Pi's operating-system permissions. Read [src/extension.ts](src/extension.ts), [src/projection.ts](src/projection.ts), [src/hydration.ts](src/hydration.ts), and [worker/laya_runtime.py](worker/laya_runtime.py) before loading it.
-
-A static scan of this extension's `src/` and `worker/` finds no telemetry client and no other network client. That is only about this extension. Pi and upstream libraries have their own behavior. Use `PI_TELEMETRY=0`, `PI_OFFLINE=1`, `HF_HUB_OFFLINE=1`, and `TRANSFORMERS_OFFLINE=1` for those switches.
-
-## Observed usefulness
-
-The recorded E03 outcome is `no-demonstrated-benefit`. There is no demonstrated benefit. The trial was one synthetic-session pair, model `openai-codex/gpt-6-luna`, thinking low, Pi 1.0.2, 8 provider calls, 3 Laya decisions. Both arms scored correct by a keyword oracle. The native arm ran first. Token usage was not recorded.
+One synthetic trial compared a native arm with a memory arm. The native arm ran first. The result was no demonstrated benefit. The keyword oracle did not show a gain. Token usage was not recorded. The model was `openai-codex/gpt-6-luna` at thinking low, with 8 provider calls and 3 Laya decisions.
 
 ## Known limitations
 
-- macOS arm64, English, one Pi session; no cross-session memory.
-- Pi 1.0.2 provider-backed memory formation is not verified. Formation was last verified on Pi 0.87.1. On 1.0.2 the recorded compaction and resume ran with generation off, and the no-provider suites ran. A provider-backed formation run on 1.0.2 needs fresh consent and is not scheduled.
-- Flag names still use the historical `e01-*` prefix.
-- The checkpoint path and the Laya source checkout are pinned and machine-specific.
-- Laya confidence is uncalibrated for some choices.
-- The first Laya load can take seconds.
-- No build, lint, typecheck, or CI is configured.
-- This is not a Pi package and has no `pi install` flow.
-- Not published. The single pre-publication security review has not been run.
+- Checked on macOS arm64, English, and one Pi session. There is no cross-session memory.
+- Provider-backed memory formation is not verified on Pi 1.0.2. It was last verified on Pi 0.87.1. Pi 1.0.2 checks so far used generation off, in no-provider runs.
+- In RPC mode the confirmation waits for the client's answer.
+- The first Laya load can take seconds. Laya confidence is uncalibrated for some choices.
+- No build, lint, typecheck, or CI is configured. Laya setup is machine-specific.
+- This is experimental. The security review has not been run.
+
+## Laya setup
+
+Point `PI_SESSION_MEMORY_PYTHON` at a Python 3.11 interpreter that can import Laya. This VCS-form install is not run by this project:
+
+```sh
+uv pip install "laya @ git+https://github.com/NandhaKishorM/laya@010bacef009c855ccba814b51f7c8e1d38ab5e3f"
+```
+
+No download command is verified here. The checkpoint is the Hugging Face cache snapshot `models--convaiinnovations--laya-typed-decisions/snapshots/f9ab0b228f0fc0f14d873dbc99038f135c2da1b2`. The hub directory is `HF_HUB_CACHE`, otherwise `$HF_HOME/hub`, otherwise `$XDG_CACHE_HOME/huggingface/hub`, otherwise `~/.cache/huggingface/hub`. `PI_SESSION_MEMORY_LAYA_CHECKPOINT` overrides that directory. Check the weights with `shasum -a 256 model.safetensors` and compare it with the SHA-256 above. To refuse a hub fetch, set `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`.
+
+## Check your install
+
+The first block needs no Laya cache and sends no provider request. It installs the package into a temporary Pi agent directory, checks that `/memory` is listed, checks that `pi --no-extensions` hides it, then removes it. The second block needs the two environment variables. The doc test skips that block when they are absent.
+
+<!-- verify-install:start -->
+```sh
+set -euo pipefail
+agent="$(mktemp -d)"
+trap 'rm -rf "$agent"' EXIT
+export PI_CODING_AGENT_DIR="$agent"
+export PI_OFFLINE=1
+pi --version
+node --version
+pi install "$PWD"
+loaded="$(printf '%s\n' '{"type":"get_commands","id":"commands"}' | pi --mode rpc --no-session)"
+printf '%s\n' "$loaded" | grep -F '"name":"memory"' >/dev/null
+disabled="$(printf '%s\n' '{"type":"get_commands","id":"commands"}' | pi --mode rpc --no-session --no-extensions)"
+if printf '%s\n' "$disabled" | grep -F '"name":"memory"' >/dev/null; then
+  echo "memory listed while extensions are disabled" >&2
+  exit 1
+fi
+pi remove "$PWD"
+removed="$(printf '%s\n' '{"type":"get_commands","id":"commands"}' | pi --mode rpc --no-session)"
+if printf '%s\n' "$removed" | grep -F '"name":"memory"' >/dev/null; then
+  echo "memory still listed after remove" >&2
+  exit 1
+fi
+```
+<!-- verify-install:end -->
+
+<!-- verify-laya:start -->
+```sh
+set -euo pipefail
+: "${PI_SESSION_MEMORY_PYTHON:?set PI_SESSION_MEMORY_PYTHON}"
+: "${PI_SESSION_MEMORY_LAYA_CHECKPOINT:?set PI_SESSION_MEMORY_LAYA_CHECKPOINT}"
+unset NODE_TEST_CONTEXT
+"$PI_SESSION_MEMORY_PYTHON" -m unittest discover -s worker/tests -p 'test_*.py'
+node --test test/pi/projection.test.ts
+```
+<!-- verify-laya:end -->
 
 ## Status
 
-Publication is pending an explicit owner instruction. The security review is pending. Neither has been run.
-
-## Walkthrough
-
-Run from the repository root. Copy a session jsonl that already contains observation, reflection, and supersession entries, and export that copy as `SESSION_COPY`. The block opens a further copy under a throwaway agent directory.
-
-<!-- e04-walkthrough:start -->
-```sh
-set -euo pipefail
-repo="${PWD}"
-case "${SESSION_COPY}" in
-  /*) ;;
-  *) SESSION_COPY="${repo}/${SESSION_COPY}" ;;
-esac
-export PATH="/opt/homebrew/bin:${PATH}"
-export PI_SESSION_MEMORY_PYTHON="${PI_SESSION_MEMORY_PYTHON:-${HOME}/.cache/pi-session-memory/bp-init-laya-010bacef/bin/python}"
-export PYTHONDONTWRITEBYTECODE=1
-export PI_OFFLINE=1
-export PI_SKIP_VERSION_CHECK=1
-export PI_TELEMETRY=0
-export HF_HOME="${HF_HOME:-${HOME}/.cache/pi-session-memory/bp-init-laya-010bacef/hf}"
-export HF_HUB_OFFLINE=1
-export TRANSFORMERS_OFFLINE=1
-export USE_TF=0
-export TOKENIZERS_PARALLELISM=false
-test -f "${repo}/src/extension.ts"
-test -f "${repo}/test/pi/projection.test.ts"
-test -n "${SESSION_COPY}"
-test -f "${SESSION_COPY}"
-pi_version="$(pi --version)"
-test "${pi_version}" = "1.0.2"
-node_version="$(node --version)"
-test "${node_version}" = "v26.7.0"
-test -x "${PI_SESSION_MEMORY_PYTHON}"
-py_version="$("${PI_SESSION_MEMORY_PYTHON}" --version 2>&1)"
-test "${py_version}" = "Python 3.11.15"
-revision="f9ab0b228f0fc0f14d873dbc99038f135c2da1b2"
-weights="${HF_HOME}/hub/models--convaiinnovations--laya-typed-decisions/snapshots/${revision}/model.safetensors"
-test -r "${weights}"
-expected_sha="4fa56de72383a9d3efa9cfa78955733c81b9fc8067a587ca4beb82c78107a24e"
-actual_sha="$(shasum -a 256 "${weights}" | awk '{print $1}')"
-test "${actual_sha}" = "${expected_sha}"
-agent="$(mktemp -d)"
-work="$(mktemp -d)"
-pi_home="$(mktemp -d)"
-cleanup() {
-  if [ -n "${agent:-}" ]; then rm -rf "${agent}"; fi
-  if [ -n "${work:-}" ]; then rm -rf "${work}"; fi
-  if [ -n "${pi_home:-}" ]; then rm -rf "${pi_home}"; fi
-}
-trap cleanup EXIT
-export PI_CODING_AGENT_DIR="${agent}"
-extension="${repo}/src/extension.ts"
-cd "${pi_home}"
-pi --extension "${extension}" --help | grep -F -- "--e01-memory-generation"
-echo LOADED
-printf '%s\n' "{\"extensions\":[\"${extension}\"]}" > "${agent}/settings.json"
-pi --help | grep -F -- "--e01-memory-candidates"
-disabled="$(pi --no-extensions --help)"
-case "${disabled}" in
-  *--e01-*)
-    echo "memory flags still listed with --no-extensions" >&2
-    exit 1
-    ;;
-esac
-echo DISABLED
-printf '%s\n' "{}" > "${agent}/settings.json"
-removed="$(pi --help)"
-case "${removed}" in
-  *--e01-*)
-    echo "memory flags still listed after settings.json removal" >&2
-    exit 1
-    ;;
-esac
-echo REMOVED
-test -f "${extension}"
-test -x "${PI_SESSION_MEMORY_PYTHON}"
-test -r "${weights}"
-copy_hash="$(shasum -a 256 "${SESSION_COPY}" | awk '{print $1}')"
-cp "${SESSION_COPY}" "${work}/session.jsonl"
-rpc="$(pi --mode rpc --no-extensions --session-dir "${work}" --session "${work}/session.jsonl" --no-context-files --no-skills --no-tools <<EOF
-{"type":"get_entries","id":"entries"}
-{"type":"get_messages","id":"messages"}
-EOF
-)"
-printf '%s\n' "${rpc}" | grep -F -- "pi-session-memory.observation"
-printf '%s\n' "${rpc}" | grep -F -- "pi-session-memory.reflection"
-printf '%s\n' "${rpc}" | grep -F -- "pi-session-memory.supersession"
-"${PI_SESSION_MEMORY_PYTHON}" - "${SESSION_COPY}" "${work}/session.jsonl" <<'PY'
-import pathlib, sys
-original = pathlib.Path(sys.argv[1]).read_bytes()
-opened = pathlib.Path(sys.argv[2]).read_bytes()
-if not opened.startswith(original):
-    raise SystemExit("opened session dropped or rewrote the original prefix")
-print("PREFIX_OK")
-PY
-after_hash="$(shasum -a 256 "${SESSION_COPY}" | awk '{print $1}')"
-test "${after_hash}" = "${copy_hash}"
-echo SESSION_COPY_UNCHANGED
-cd "${repo}"
-unset NODE_TEST_CONTEXT
-node --test --test-reporter tap test/pi/projection.test.ts
-echo PROJECTION_OK
-```
-<!-- e04-walkthrough:end -->
+Experimental. Not published. Publication is pending. The security review has not been run.

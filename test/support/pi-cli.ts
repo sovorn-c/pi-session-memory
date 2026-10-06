@@ -12,23 +12,19 @@ export const piExecutable = execFileSync("which", ["pi"], { encoding: "utf8" }).
 export const piRoot = resolve(dirname(await realpath(piExecutable)), "../..");
 export const piVersion = (JSON.parse(await readFile(resolve(piRoot, "package.json"), "utf8")) as { version?: unknown }).version;
 
-export const MEMORY_FLAGS = [
-  "--e01-memory-generation",
-  "--e01-observe-after-tokens",
-  "--e01-reflect-after-tokens",
-  "--e01-memory-candidates",
-  "--e01-memory-projection-chars",
-] as const;
+const CHILD_ENV_ALLOW = ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "TERM"] as const;
+
+export function helpOptionLines(help: string): string[] {
+  return [...new Set(help.split("\n").map((line) => line.trim()).filter((line) => /^--?\S/.test(line)))].sort();
+}
 
 export const PROVIDER_OPT_IN_KEYS = [
-  "PI_SESSION_MEMORY_E01_REAL_PI",
-  "PI_SESSION_MEMORY_E01_PROVIDER_TEST",
-  "PI_SESSION_MEMORY_E03_PROVIDER_TRIAL",
-  "PI_SESSION_MEMORY_E01_MODEL",
-  "PI_SESSION_MEMORY_E01_THINKING",
+  "PI_SESSION_MEMORY_REAL_PI_TEST",
+  "PI_SESSION_MEMORY_PROVIDER_TEST",
+  "PI_SESSION_MEMORY_PROVIDER_TRIAL",
+  "PI_SESSION_MEMORY_TEST_MODEL",
+  "PI_SESSION_MEMORY_TEST_THINKING",
 ] as const;
-
-const GENERATION_HELP = "Enable gated memory generation. Accepted session-derived text may be sent to the current Pi provider only after the extension displays its disclosure and you confirm.";
 
 export function sha256(bytes: Buffer | string): string {
   return createHash("sha256").update(bytes).digest("hex");
@@ -38,13 +34,6 @@ export function assertOptInsUnset(env: NodeJS.ProcessEnv = process.env): void {
   for (const key of PROVIDER_OPT_IN_KEYS) {
     if (env[key] !== undefined) throw new Error(`${key} is set; operator checks refuse provider opt-in`);
   }
-}
-
-export function assertMemoryFlags(help: string): void {
-  for (const flag of MEMORY_FLAGS) {
-    if (!help.includes(flag)) throw new Error(`missing ${flag}`);
-  }
-  if (!help.includes(GENERATION_HELP)) throw new Error("missing generation opt-in disclosure in help");
 }
 
 export async function disposableTree(prefix: string): Promise<{ root: string; agentDir: string; cwd: string; sessionDir: string }> {
@@ -73,12 +62,15 @@ export async function runPi(options: {
   stdin?: string;
   timeoutMs?: number;
 }): Promise<PiRun> {
-  const env: NodeJS.ProcessEnv = { ...process.env, ...options.extraEnv };
-  for (const key of PROVIDER_OPT_IN_KEYS) delete env[key];
+  const env: NodeJS.ProcessEnv = {};
+  for (const key of CHILD_ENV_ALLOW) {
+    if (process.env[key] !== undefined) env[key] = process.env[key];
+  }
   env.PI_CODING_AGENT_DIR = options.agentDir;
   env.PI_OFFLINE = "1";
   env.PI_SKIP_VERSION_CHECK = "1";
-  env.PI_TELEMETRY = "0";
+  Object.assign(env, options.extraEnv);
+  for (const key of PROVIDER_OPT_IN_KEYS) delete env[key];
   const child = spawn(piExecutable, options.args, {
     cwd: options.cwd,
     env,
@@ -112,6 +104,121 @@ export async function runPi(options: {
     if (timer) clearTimeout(timer);
     if (child.exitCode === null && child.signalCode === null) killGroup(child.pid);
   }
+}
+
+export interface RpcEvent {
+  type?: string;
+  id?: string;
+  success?: boolean;
+  method?: string;
+  message?: string;
+  data?: { disposition?: string; commands?: Array<{ name?: string }> };
+}
+
+export async function openPiRpc(options: {
+  args: string[];
+  cwd: string;
+  agentDir: string;
+  extraEnv?: NodeJS.ProcessEnv;
+  timeoutMs?: number;
+}): Promise<{
+  request: (command: Record<string, unknown>, timeoutMs?: number) => Promise<{ response: RpcEvent; events: RpcEvent[] }>;
+  close: () => Promise<void>;
+}> {
+  const env: NodeJS.ProcessEnv = {};
+  for (const key of CHILD_ENV_ALLOW) {
+    if (process.env[key] !== undefined) env[key] = process.env[key];
+  }
+  env.PI_CODING_AGENT_DIR = options.agentDir;
+  env.PI_OFFLINE = "1";
+  env.PI_SKIP_VERSION_CHECK = "1";
+  Object.assign(env, options.extraEnv);
+  for (const key of PROVIDER_OPT_IN_KEYS) delete env[key];
+  const child = spawn(piExecutable, options.args, {
+    cwd: options.cwd,
+    env,
+    detached: true,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let buffer = "";
+  let stderr = "";
+  const pending: RpcEvent[] = [];
+  const waiters: Array<(line: RpcEvent) => void> = [];
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+  child.stdout.on("data", (chunk: string) => {
+    buffer += chunk;
+    let newline = buffer.indexOf("\n");
+    while (newline >= 0) {
+      const raw = buffer.slice(0, newline);
+      buffer = buffer.slice(newline + 1);
+      newline = buffer.indexOf("\n");
+      if (raw.trim().length === 0 || !raw.startsWith("{")) continue;
+      const event = JSON.parse(raw) as RpcEvent;
+      const waiter = waiters.shift();
+      if (waiter) waiter(event);
+      else pending.push(event);
+    }
+  });
+  const take = (timeoutMs: number): Promise<RpcEvent> => {
+    const queued = pending.shift();
+    if (queued) return Promise.resolve(queued);
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const index = waiters.indexOf(deliver);
+        if (index >= 0) waiters.splice(index, 1);
+        reject(new Error(`rpc timed out after ${timeoutMs}ms\nstderr:\n${stderr.slice(0, 800)}`));
+      }, timeoutMs);
+      function deliver(event: RpcEvent): void {
+        clearTimeout(timer);
+        resolve(event);
+      }
+      waiters.push(deliver);
+    });
+  };
+  let sequence = 0;
+  return {
+    async request(command, timeoutMs = options.timeoutMs ?? 20_000) {
+      const id = `rpc-${sequence += 1}`;
+      const events: RpcEvent[] = [];
+      child.stdin.write(`${JSON.stringify({ ...command, id })}\n`);
+      const deadline = Date.now() + timeoutMs;
+      let response: RpcEvent | undefined;
+      while (Date.now() < deadline) {
+        const event = await take(deadline - Date.now());
+        events.push(event);
+        if (event.type === "response" && event.id === id) {
+          response = event;
+          break;
+        }
+      }
+      if (!response) throw new Error(`rpc response ${id} missing\nstderr:\n${stderr.slice(0, 800)}`);
+      const idleUntil = Date.now() + 200;
+      while (Date.now() < idleUntil) {
+        const queued = pending.shift();
+        if (queued) {
+          events.push(queued);
+          continue;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 40));
+      }
+      return { response, events };
+    },
+    async close() {
+      child.stdin.end();
+      const exited = once(child, "exit");
+      const timer = setTimeout(() => killGroup(child.pid), 2_000);
+      try {
+        await exited;
+      } finally {
+        clearTimeout(timer);
+        if (child.exitCode === null && child.signalCode === null) killGroup(child.pid);
+      }
+    },
+  };
 }
 
 function killGroup(pid: number | undefined): void {

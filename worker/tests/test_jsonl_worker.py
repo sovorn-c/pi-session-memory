@@ -1,3 +1,4 @@
+import importlib
 import io
 import json
 import math
@@ -12,6 +13,20 @@ from worker.protocol import GateRequest, parse_request, serve
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _laya_skip_reason() -> str | None:
+    try:
+        importlib.import_module("laya")
+    except ImportError:
+        return "Laya runtime unavailable: laya is not importable"
+    from worker.laya_runtime import checkpoint_directory
+    if not (checkpoint_directory() / "model.safetensors").is_file():
+        return "Laya runtime unavailable: checkpoint weights are missing"
+    return None
+
+
+_LAYA_SKIP_REASON = _laya_skip_reason()
 
 
 class SupersessionGateTests(unittest.TestCase):
@@ -121,17 +136,13 @@ except SystemExit as error:
             "Laya worker requires Python 3.11; set PI_SESSION_MEMORY_PYTHON to a Python 3.11 interpreter.\n",
         )
 
+    @unittest.skipUnless(_LAYA_SKIP_REASON is None, _LAYA_SKIP_REASON or "Laya runtime unavailable")
     def test_one_process_serves_bounded_formation_and_projection_requests(self):
         env = os.environ.copy()
-        env.update(
-            {
-                "HF_HOME": "/Users/sovorn/.cache/pi-session-memory/bp-init-laya-010bacef/hf",
-                "HF_HUB_OFFLINE": "1",
-                "TRANSFORMERS_OFFLINE": "1",
-                "USE_TF": "0",
-                "TOKENIZERS_PARALLELISM": "false",
-            }
-        )
+        env.setdefault("HF_HUB_OFFLINE", "1")
+        env.setdefault("TRANSFORMERS_OFFLINE", "1")
+        env.setdefault("USE_TF", "0")
+        env.setdefault("TOKENIZERS_PARALLELISM", "false")
         projection_state = json.dumps(
             {
                 "need": "Which earlier decision keeps Pi session provenance exact while projecting only needed memory?",

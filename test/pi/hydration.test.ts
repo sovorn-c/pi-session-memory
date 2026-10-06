@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { test } from "node:test";
-import extensionFactory from "../../src/extension.ts";
+import { registerFormation } from "../../src/formation.ts";
 import { registerHydration } from "../../src/hydration.ts";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -199,13 +199,16 @@ test("Pi's registered model-callable hydration tool resolves only the active bra
   const extensionRuntime = createExtensionRuntime();
   extensionRuntime.refreshTools = () => {};
   const loadedExtension = await loadExtensionFromFactory(
-    (pi) => extensionFactory(pi),
+    (pi) => {
+      registerFormation(pi, { agentDir: () => tempDir });
+      registerHydration(pi);
+    },
     projectRoot,
     createEventBus(),
     extensionRuntime,
     "<pi-hydration-integration>",
   );
-  assert.equal(extensionRuntime.flagValues.get("e01-memory-generation"), false, "formation remains disabled by default");
+  assert.equal(extensionRuntime.flagValues.get("memory-generation"), undefined, "formation registers no generation flag");
   let providerCalls = 0;
   const modelRegistry = new ModelRegistry({ complete: async () => { providerCalls += 1; throw new Error("provider must not be called by hydration"); } });
   const runner = new ExtensionRunner([loadedExtension], extensionRuntime, projectRoot, sessionManager, modelRegistry);

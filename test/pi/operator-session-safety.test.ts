@@ -15,8 +15,8 @@ const { SessionManager } = await import(pathToFileURL(resolve(piRoot, "dist/core
   };
 };
 
-const observationText = "E04 observation zeta-marble stays out of model messages.";
-const reflectionText = "E04 reflection zeta-marble stays out of model messages.";
+const observationText = "Session observation zeta-marble stays out of model messages.";
+const reflectionText = "Session reflection zeta-marble stays out of model messages.";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -39,10 +39,10 @@ function rpcData(stdout: string, id: string): Record<string, unknown> {
   return match.data;
 }
 
-test("SC-e04s01-P0-02: session bytes and memory entries survive load, disable, removal, and a missing Python", { timeout: 120_000 }, async (t) => {
+test("P0-02: session bytes and memory entries survive load, disable, removal, and a missing Python", { timeout: 120_000 }, async (t) => {
   assert.equal(piVersion, "1.0.2");
   assertOptInsUnset();
-  const tree = await disposableTree("pi-session-memory-e04-session-");
+  const tree = await disposableTree("pi-session-memory-session-");
   const marker = resolve(tree.root, "worker-started");
   const fakePython = resolve(tree.root, "fake-python");
   const missingPython = resolve(tree.root, "missing-python");

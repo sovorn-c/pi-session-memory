@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { test } from "node:test";
+import { DEFAULT_GENERATION, DEFAULT_OBSERVE_AFTER_TOKENS, DEFAULT_PYTHON, DEFAULT_REFLECT_AFTER_TOKENS } from "../../src/config.ts";
+import { CANDIDATES, PROJECTION_CHARS } from "../../src/projection.ts";
 import { fencedBlocks, lineCount, productText, projectRoot, readRepo, relativeLinks, sections } from "../support/readme.ts";
 
 const EXPECTED = {
@@ -17,7 +19,7 @@ const EXPECTED = {
 };
 
 function bashSyntax(block: string): void {
-  const dir = mkdtempSync(resolve(tmpdir(), "e04-bashn-"));
+  const dir = mkdtempSync(resolve(tmpdir(), "readme-bash-"));
   try {
     const file = resolve(dir, "block.sh");
     writeFileSync(file, block);
@@ -27,13 +29,24 @@ function bashSyntax(block: string): void {
   }
 }
 
-function checkSetup(markdown: string, flags: string[], productEnv: Set<string>, runtimeSource: string): void {
-  const documented = [...markdown.matchAll(/--(e01-[a-z0-9-]+)/g)].map((match) => match[1] ?? "");
-  for (const flag of documented) {
-    if (!flags.includes(flag)) throw new Error(`unknown flag --${flag}`);
+function checkSetup(markdown: string, productEnv: Set<string>, runtimeSource: string): void {
+  if (/registerFlag/.test(markdown)) throw new Error("README still documents a flag");
+  const manifest = JSON.parse(readFileSync(resolve(projectRoot, "package.json"), "utf8")) as { pi?: { extensions?: string[] } };
+  const entry = manifest.pi?.extensions?.[0];
+  if (!entry || !markdown.includes(entry)) throw new Error("install text omits the package extension path");
+  if (!markdown.includes("pi install /path/to/pi-session-memory")) throw new Error("missing install command");
+  if (!markdown.includes("pi remove /path/to/pi-session-memory")) throw new Error("missing remove command");
+  if (!markdown.includes("pi --no-extensions")) throw new Error("missing full disable");
+  for (const [key, value] of [
+    ["generation", String(DEFAULT_GENERATION)],
+    ["python", DEFAULT_PYTHON],
+    ["observeAfterTokens", String(DEFAULT_OBSERVE_AFTER_TOKENS)],
+    ["reflectAfterTokens", String(DEFAULT_REFLECT_AFTER_TOKENS)],
+  ] as const) {
+    if (!markdown.includes(key) || !markdown.includes(value)) throw new Error(`missing config ${key}`);
   }
-  for (const flag of flags) {
-    if (!markdown.includes(`--${flag}`)) throw new Error(`undocumented flag --${flag}`);
+  if (!markdown.includes(String(CANDIDATES)) || !markdown.includes(String(PROJECTION_CHARS))) {
+    throw new Error("missing internal limits");
   }
   for (const name of markdown.match(/PI_SESSION_MEMORY_[A-Z0-9_]+/g) ?? []) {
     if (!productEnv.has(name)) throw new Error(`unknown env ${name}`);
@@ -49,46 +62,26 @@ function checkSetup(markdown: string, flags: string[], productEnv: Set<string>, 
   const revision = runtimeSource.match(/CHECKPOINT_REVISION = "([0-9a-f]+)"/)?.[1];
   const sha = runtimeSource.match(/CHECKPOINT_SHA256 = "([0-9a-f]+)"/)?.[1];
   if (commit !== EXPECTED.commit || revision !== EXPECTED.revision || sha !== EXPECTED.sha) {
-    throw new Error("worker/laya_runtime.py constants drifted from the recorded target");
+    throw new Error("worker constants drifted");
   }
-  if (!runtimeSource.includes(`"${EXPECTED.laya}"`)) throw new Error("Laya 0.3.7 is not pinned in worker/laya_runtime.py");
-  for (const token of ["HF_HOME", "HF_HUB_OFFLINE=1", "TRANSFORMERS_OFFLINE=1"]) {
-    if (!markdown.includes(token)) throw new Error(`missing ${token}`);
+  if (!runtimeSource.includes(`"${EXPECTED.laya}"`)) throw new Error("Laya version is not pinned");
+  for (const heading of ["Install", "Requirements", "Configure", "Use", "Disable and remove"]) {
+    if (!sections(markdown).some((section) => section.heading === heading)) throw new Error(`missing ${heading}`);
   }
-  const blocks = fencedBlocks(markdown, "sh");
-  if (blocks.length === 0) throw new Error("no sh blocks");
-  for (const block of blocks) bashSyntax(block);
+  for (const block of fencedBlocks(markdown, "sh")) bashSyntax(block);
   for (const link of relativeLinks(markdown)) {
     if (!existsSync(resolve(projectRoot, link))) throw new Error(`broken link ${link}`);
   }
-  const lines = lineCount(markdown);
-  if (lines > 300) throw new Error(`README has ${lines} lines`);
-  const provisioning = sections(markdown).find((section) => /provisioning/i.test(section.heading));
-  if (!provisioning) throw new Error("missing provisioning section");
-  const provisioningText = `${provisioning.heading}\n${provisioning.body}`;
-  if (!/not re-run/i.test(provisioningText)) throw new Error("provisioning section does not say the commands are not re-run");
-  if (!provisioning.body.includes("uv venv") || !provisioning.body.includes("uv pip install")) {
-    throw new Error("recorded provisioning commands are missing");
-  }
-  if (!provisioning.body.includes("https://github.com/NandhaKishorM/laya")) throw new Error("missing upstream Laya link");
-  for (const heading of ["setup", "load", "disable", "remove"]) {
-    if (!sections(markdown).some((section) => section.heading.toLowerCase().includes(heading))) {
-      throw new Error(`missing ${heading} heading`);
-    }
-  }
+  if (lineCount(markdown) > 300) throw new Error("README is too long");
 }
 
-test("SC-e04s02-P1-01: README setup matches registered flags, env vars, and pinned constants", async () => {
+test("README setup matches the package, config defaults, and pinned constants", async () => {
   const readme = await readRepo("README.md");
-  const extension = await readRepo("src/extension.ts");
-  const projection = await readRepo("src/projection.ts");
   const runtime = await readRepo("worker/laya_runtime.py");
-  const flags = [...new Set([...`${extension}\n${projection}`.matchAll(/"(e01-[a-z0-9-]+)"/g)].map((match) => match[1] ?? ""))];
   const productEnv = new Set((await productText()).match(/PI_SESSION_MEMORY_[A-Z0-9_]+/g) ?? []);
-  assert.equal(flags.length, 5);
-  checkSetup(readme, flags, productEnv, runtime);
-  assert.throws(() => checkSetup(`${readme}\n--e01-not-a-flag\n`, flags, productEnv, runtime), /unknown flag/);
-  assert.throws(() => checkSetup(`${readme}\nPI_SESSION_MEMORY_NOT_REAL\n`, flags, productEnv, runtime), /unknown env/);
-  assert.throws(() => checkSetup(readme.replaceAll(EXPECTED.sha, "0".repeat(64)), flags, productEnv, runtime), /missing pinned value/);
-  assert.throws(() => checkSetup(`${readme}\n[missing](docs/no-such-e04-file.md)\n`, flags, productEnv, runtime), /broken link/);
+  checkSetup(readme, productEnv, runtime);
+  assert.throws(() => checkSetup(`${readme}\nregisterFlag("generation")\n`, productEnv, runtime), /still documents a flag/);
+  assert.throws(() => checkSetup(`${readme}\nPI_SESSION_MEMORY_NOT_REAL\n`, productEnv, runtime), /unknown env/);
+  assert.throws(() => checkSetup(readme.replaceAll(EXPECTED.sha, "0".repeat(64)), productEnv, runtime), /missing pinned value/);
+  assert.throws(() => checkSetup(`${readme}\n[missing](docs/no-such-file.md)\n`, productEnv, runtime), /broken link/);
 });

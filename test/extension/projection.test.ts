@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
-import { registerFormation } from "../../src/extension.ts";
+import { registerFormation } from "../../src/formation.ts";
 
 const observationType = "pi-session-memory.observation";
 const reflectionType = "pi-session-memory.reflection";
@@ -105,16 +108,15 @@ function recordDiagnostics({ scenario, expectedId, runtime, result }) {
   };
 }
 
-function projectionRuntime({ branch = [], select, resident, candidateLimit = "6", outputLimit = "4000" } = {}) {
+function projectionRuntime({ branch = [], select, resident, candidateLimit = 6, outputLimit = 4000 } = {}) {
   const handlers = new Map();
-  const flags = new Map();
   const requests = [];
+  const limits = { candidates: Number(candidateLimit), chars: Number(outputLimit) };
   let activeBranch = branch;
   let sessionId = "projection-session";
   const pi = {
-    registerFlag(name, options) { if (!flags.has(name)) flags.set(name, options.default); },
-    getFlag(name) { return flags.get(name); },
     on(name, handler) { handlers.set(name, handler); },
+    registerCommand() {},
     registerTool() {},
     appendEntry() { throw new Error("projection must not append durable entries"); },
   };
@@ -126,16 +128,18 @@ function projectionRuntime({ branch = [], select, resident, candidateLimit = "6"
     const selectedEntryId = select ? await select(request, candidates) : candidates[0]?.entryId;
     return { selected_entry_id: selectedEntryId ?? null };
   };
-  registerFormation(pi, { evaluateGate });
-  flags.set("e01-memory-candidates", candidateLimit);
-  flags.set("e01-memory-projection-chars", outputLimit);
+  registerFormation(pi, {
+    evaluateGate,
+    agentDir: () => mkdtempSync(join(tmpdir(), "pi-session-memory-projection-")),
+    projectionLimits: limits,
+  });
   return {
     ctx,
     requests,
     handlers,
     setBranch(next) { activeBranch = next; },
     setSessionId(next) { sessionId = next; },
-    setOutputLimit(value) { flags.set("e01-memory-projection-chars", value); },
+    setOutputLimit(value) { limits.chars = Number(value); },
     async context(text, previous = []) {
       const messages = [
         ...previous,
@@ -540,7 +544,7 @@ test("context and branch uncertainty fail open to the original Pi messages", asy
   assert.deepEqual(result, { messages: original });
 });
 
-test("SC-e03s01-P1-01: old relevant observation among >=10 recent decoys narrows within bounds and carries exact source ID", async () => {
+test("P1-01: old relevant observation among >=10 recent decoys narrows within bounds and carries exact source ID", async () => {
   const { branch, expectedObservationId, expectedRawLookupId } = syntheticDecisionFixture({ decoyCount: 10 });
   const canonicalBefore = structuredClone(branch);
   const runtime = projectionRuntime({
@@ -573,7 +577,7 @@ test("SC-e03s01-P1-01: old relevant observation among >=10 recent decoys narrows
 
   assert.deepEqual(branch, canonicalBefore, "canonical branch must not be mutated");
 
-  const diag = recordDiagnostics({ scenario: "SC-e03s01-P1-01", expectedId: expectedObservationId, runtime, result, branch });
+  const diag = recordDiagnostics({ scenario: "P1-01", expectedId: expectedObservationId, runtime, result, branch });
   assert.equal(diag.classification, "retrieval_included");
   assert.equal(diag.selectedId, expectedObservationId);
 
@@ -587,11 +591,11 @@ test("SC-e03s01-P1-01: old relevant observation among >=10 recent decoys narrows
   const relatedResult = await runtimeRelated.context(relatedQuery);
   const relatedState = JSON.parse(runtimeRelated.requests[0].state);
   assert.ok(relatedState.candidates.some(({ entryId }) => entryId === expectedObservationId), "related-symbol query must include the relevant observation");
-  const relatedDiag = recordDiagnostics({ scenario: "SC-e03s01-P1-01-related", expectedId: expectedObservationId, runtime: runtimeRelated, result: relatedResult, branch });
+  const relatedDiag = recordDiagnostics({ scenario: "P1-01-related", expectedId: expectedObservationId, runtime: runtimeRelated, result: relatedResult, branch });
   assert.equal(relatedDiag.classification, "retrieval_included");
 });
 
-test("SC-e03s01-P1-02: valid reflection among >=10 recent decoys survives narrowing and carries exact supporting observation and raw IDs", async () => {
+test("P1-02: valid reflection among >=10 recent decoys survives narrowing and carries exact supporting observation and raw IDs", async () => {
   const { branch, expectedReflectionId, expectedObservationId, expectedRawLookupId, expectedRawIntegrityId } = syntheticDecisionFixture({ decoyCount: 10 });
   const canonicalBefore = structuredClone(branch);
   const runtime = projectionRuntime({
@@ -637,12 +641,12 @@ test("SC-e03s01-P1-02: valid reflection among >=10 recent decoys survives narrow
 
   assert.deepEqual(branch, canonicalBefore, "canonical branch must not be mutated");
 
-  const diag = recordDiagnostics({ scenario: "SC-e03s01-P1-02", expectedId: expectedReflectionId, runtime, result: projectedMessages, branch });
+  const diag = recordDiagnostics({ scenario: "P1-02", expectedId: expectedReflectionId, runtime, result: projectedMessages, branch });
   assert.equal(diag.classification, "retrieval_included");
   assert.equal(diag.selectedId, expectedReflectionId);
 });
 
-test("SC-e03s01-P0-03: reflection with orphan, off-branch, stale, or unresolved support is excluded and native messages survive", async () => {
+test("P0-03: reflection with orphan, off-branch, stale, or unresolved support is excluded and native messages survive", async () => {
   // Case A: Reflection with missing/orphan supporting observation
   const orphanRef = reflection("reflection-orphan-support", "Rationale with missing supporting observation.", ["observation-nonexistent"]);
   const runtimeOrphan = projectionRuntime({ branch: [orphanRef] });
@@ -781,7 +785,7 @@ function residentCandidateId(request) {
   }
 }
 
-test("SC-e03s02-P1-01: consecutive sufficient observation requests keep byte-identical projection and projection,resident,resident gates", async () => {
+test("P1-01: consecutive sufficient observation requests keep byte-identical projection and projection,resident,resident gates", async () => {
   const { branch, expectedObservationId } = syntheticDecisionFixture({ decoyCount: 10 });
   const runtime = projectionRuntime({
     branch,
@@ -812,7 +816,7 @@ test("SC-e03s02-P1-01: consecutive sufficient observation requests keep byte-ide
   assert.match(firstText, new RegExp(expectedObservationId));
 });
 
-test("SC-e03s02-P1-01: consecutive sufficient reflection requests keep byte-identical projection and projection,resident,resident gates", async () => {
+test("P1-01: consecutive sufficient reflection requests keep byte-identical projection and projection,resident,resident gates", async () => {
   const { branch, expectedReflectionId } = syntheticDecisionFixture({ decoyCount: 10 });
   const runtime = projectionRuntime({
     branch,
@@ -841,7 +845,7 @@ test("SC-e03s02-P1-01: consecutive sufficient reflection requests keep byte-iden
   assert.match(firstText, /\[reflection reflection-storage-architecture\]/);
 });
 
-test("SC-e03s02-P1-02: a rejected resident on a changed need re-selects from the current branch without retaining the insufficient observation", async () => {
+test("P1-02: a rejected resident on a changed need re-selects from the current branch without retaining the insufficient observation", async () => {
   const { branch, expectedObservationId, expectedReflectionId } = syntheticDecisionFixture({ decoyCount: 10 });
   let residentCalls = 0;
   const runtime = projectionRuntime({
@@ -879,7 +883,7 @@ test("SC-e03s02-P1-02: a rejected resident on a changed need re-selects from the
   assert.ok(projectionStates[1].state.includes(expectedReflectionId), "second selection must use current bounded candidates");
 });
 
-test("SC-e03s02-P1-02: rejected resident with null selection does not re-project the insufficient resident for the changed need", async () => {
+test("P1-02: rejected resident with null selection does not re-project the insufficient resident for the changed need", async () => {
   const { branch, expectedObservationId } = syntheticDecisionFixture({ decoyCount: 5 });
   let projectionCalls = 0;
   const runtime = projectionRuntime({
@@ -905,7 +909,7 @@ test("SC-e03s02-P1-02: rejected resident with null selection does not re-project
   assert.equal(residentCandidateId(runtime.requests[1]), expectedObservationId);
 });
 
-test("SC-e03s02-P1-04 control: observation resident accepted on a reflection-labeled need matches e03s01 real-Laya path without blocking projection when sufficiency rejects", async () => {
+test("P1-04 control: observation resident accepted on a reflection-labeled need matches projection real-Laya path without blocking projection when sufficiency rejects", async () => {
   const { branch, expectedObservationId, expectedReflectionId } = syntheticDecisionFixture({ decoyCount: 10 });
   const acceptResident = projectionRuntime({
     branch,
@@ -941,7 +945,7 @@ test("SC-e03s02-P1-04 control: observation resident accepted on a reflection-lab
   assert.equal(countMemoryProjectionMessages(secondReject), 1);
 });
 
-test("E03 fallthrough strips prior memory projection when the follow-up request has no memory need", async () => {
+test("Continuation fallthrough strips prior memory projection when the follow-up request has no memory need", async () => {
   const { branch, expectedObservationId } = syntheticDecisionFixture({ decoyCount: 5 });
   const runtime = projectionRuntime({
     branch,
@@ -955,7 +959,7 @@ test("E03 fallthrough strips prior memory projection when the follow-up request 
   assert.equal(second.at(-1).content[0].text, "Please explain merge sort in Python.");
 });
 
-test("E03 fallthrough strips prior memory projection when resident gate state cannot be encoded", async () => {
+test("Continuation fallthrough strips prior memory projection when resident gate state cannot be encoded", async () => {
   const heavyText = "\u{1D400}".repeat(1000);
   const { branch, expectedObservationId } = syntheticDecisionFixture({ decoyCount: 3 });
   const runtime = projectionRuntime({
@@ -977,7 +981,7 @@ test("E03 fallthrough strips prior memory projection when resident gate state ca
   assert.equal(runtime.requests.filter((request) => request.gate === "resident").length, 0, "unencodable resident state must fail before the resident gate runs");
 });
 
-test("E03 fallthrough strips prior memory projection when session id changes during resident gate", async () => {
+test("Continuation fallthrough strips prior memory projection when session id changes during resident gate", async () => {
   const { branch, expectedObservationId } = syntheticDecisionFixture({ decoyCount: 3 });
   let residentStarted;
   const started = new Promise((resolveStarted) => { residentStarted = resolveStarted; });
@@ -1003,7 +1007,7 @@ test("E03 fallthrough strips prior memory projection when session id changes dur
   assert.equal(countMemoryProjectionMessages(second), 0);
 });
 
-test("E03 fallthrough strips prior memory projection when resident support disappears before gate completion", async () => {
+test("Continuation fallthrough strips prior memory projection when resident support disappears before gate completion", async () => {
   const { branch, expectedObservationId } = syntheticDecisionFixture({ decoyCount: 3 });
   let residentStarted;
   const started = new Promise((resolveStarted) => { residentStarted = resolveStarted; });
@@ -1029,7 +1033,7 @@ test("E03 fallthrough strips prior memory projection when resident support disap
   assert.equal(countMemoryProjectionMessages(second), 0);
 });
 
-test("E03 fallthrough strips prior memory projection when resident sufficiency decision is invalid", async () => {
+test("Continuation fallthrough strips prior memory projection when resident sufficiency decision is invalid", async () => {
   const { branch, expectedObservationId } = syntheticDecisionFixture({ decoyCount: 3 });
   const runtime = projectionRuntime({
     branch,
@@ -1043,7 +1047,7 @@ test("E03 fallthrough strips prior memory projection when resident sufficiency d
   assert.equal(countMemoryProjectionMessages(second), 0);
 });
 
-test("E03 fallthrough strips prior memory projection when accepted resident render exceeds output cap", async () => {
+test("Continuation fallthrough strips prior memory projection when accepted resident render exceeds output cap", async () => {
   const { branch, expectedObservationId } = syntheticDecisionFixture({ decoyCount: 3 });
   const runtime = projectionRuntime({
     branch,
@@ -1058,7 +1062,7 @@ test("E03 fallthrough strips prior memory projection when accepted resident rend
   assert.equal(countMemoryProjectionMessages(second), 0);
 });
 
-test("E03 fallthrough strips prior memory projection when projection handler throws", async () => {
+test("Continuation fallthrough strips prior memory projection when projection handler throws", async () => {
   const { branch, expectedObservationId } = syntheticDecisionFixture({ decoyCount: 3 });
   const runtime = projectionRuntime({
     branch,

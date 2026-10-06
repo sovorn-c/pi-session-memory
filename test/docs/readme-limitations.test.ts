@@ -4,8 +4,7 @@ import { readRepo } from "../support/readme.ts";
 
 const REQUIRED = [
   "no demonstrated benefit",
-  "no-demonstrated-benefit",
-  "one synthetic-session pair",
+  "One synthetic trial",
   "keyword oracle",
   "synthetic",
   "native arm ran first",
@@ -18,16 +17,18 @@ const REQUIRED = [
   "English",
   "one Pi session",
   "no cross-session memory",
-  "provider-backed memory formation is not verified",
+  "Provider-backed memory formation is not verified",
+  "Pi 1.0.2",
   "0.87.1",
+  "confirmation waits for the client's answer",
   "generation off",
   "no-provider",
-  "e01-*",
+  "internal limits",
   "machine-specific",
   "uncalibrated",
   "can take seconds",
   "No build, lint, typecheck, or CI",
-  "not a Pi package",
+  "not run by this project",
   "Not published",
   "security review has not been run",
   "Publication is pending",
@@ -59,11 +60,12 @@ function checkLimitations(markdown: string): void {
   for (const phrase of REQUIRED) {
     if (!markdown.includes(phrase)) throw new Error(`missing ${phrase}`);
   }
+  if (/not a Pi package/.test(markdown)) throw new Error("README still says this is not a package");
   const hits = forbiddenHits(markdown);
   if (hits.length > 0) throw new Error(`unmeasured claim: ${hits.join(", ")}`);
 }
 
-test("SC-e04s02-P1-03: README reports the E03 outcome and the minimum limitations", async () => {
+test("README reports the recorded trial, the limitations, and the unpublished status", async () => {
   const readme = await readRepo("README.md");
   checkLimitations(readme);
   assert.throws(() => checkLimitations(`${readme}\nMemory improves answers.\n`), /unmeasured claim/);

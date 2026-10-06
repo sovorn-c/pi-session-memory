@@ -1,16 +1,18 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
+import { layaTestEnv } from "../support/laya-env.ts";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const piExecutable = execFileSync("which", ["pi"], { encoding: "utf8" }).trim();
-const python = process.env.PI_SESSION_MEMORY_PYTHON ?? "/Users/sovorn/.cache/pi-session-memory/bp-init-laya-010bacef/bin/python";
+const laya = layaTestEnv();
+const python = laya.ready ? laya.python : "";
 
 class PiRpc {
   private readonly child: ChildProcessWithoutNullStreams;
@@ -27,22 +29,19 @@ class PiRpc {
   readonly disclosures: string[] = [];
   private protocolError: Error | undefined;
 
-  constructor(sessionDir: string) {
+  constructor(sessionDir: string, agentDir: string) {
     this.child = spawn(piExecutable, [
       "--mode", "rpc",
       "--no-extensions",
       "--extension", resolve(projectRoot, "src/extension.ts"),
       "--session-dir", sessionDir,
-      "--e01-memory-generation",
-      "--e01-observe-after-tokens", "1",
-      "--e01-reflect-after-tokens", "1",
       "--no-context-files",
       "--no-skills",
       "--no-prompt-templates",
       "--no-tools",
     ], {
       cwd: projectRoot,
-      env: { ...process.env, PI_SESSION_MEMORY_PYTHON: python },
+      env: { ...process.env, ...(laya.ready ? laya.env : {}), PI_SESSION_MEMORY_PYTHON: python, PI_CODING_AGENT_DIR: agentDir },
       stdio: ["pipe", "pipe", "ignore"],
     });
     const lines = createInterface({ input: this.child.stdout });
@@ -145,15 +144,27 @@ class PiRpc {
 }
 
 test("opted-in disposable Pi session generates active-branch observations and a reflection through the configured model", { timeout: 300_000 }, async (t) => {
-  assert.equal(process.env.PI_SESSION_MEMORY_E01_PROVIDER_TEST, "1", "this test makes real configured-provider calls and requires explicit opt-in");
+  assert.equal(process.env.PI_SESSION_MEMORY_PROVIDER_TEST, "1", "this test makes real configured-provider calls and requires explicit opt-in");
   assert.ok(piExecutable.length > 0, "Pi must be installed for the real-provider integration");
   assert.ok(python.length > 0, "the pinned Python 3.11 worker is required");
 
-  const sessionDir = await mkdtemp(resolve(tmpdir(), "pi-session-memory-e01-"));
-  const rpc = new PiRpc(sessionDir);
+  const sessionDir = await mkdtemp(resolve(tmpdir(), "pi-session-memory-provider-"));
+  const agentDir = await mkdtemp(resolve(tmpdir(), "pi-session-memory-provider-agent-"));
+  await mkdir(resolve(agentDir, "pi-session-memory"));
+  await writeFile(resolve(agentDir, "pi-session-memory", "config.json"), `${JSON.stringify({
+    generation: true,
+    observeAfterTokens: 1,
+    reflectAfterTokens: 1,
+  })}\n`);
+  const realAgent = resolve(homedir(), ".pi", "agent");
+  for (const name of ["auth.json", "models.json", "settings.json"]) {
+    await symlink(resolve(realAgent, name), resolve(agentDir, name));
+  }
+  const rpc = new PiRpc(sessionDir, agentDir);
   t.after(async () => {
     await rpc.stop();
     await rm(sessionDir, { recursive: true, force: true });
+    await rm(agentDir, { recursive: true, force: true });
   });
 
   const stateResponse = await rpc.command({ type: "get_state" });

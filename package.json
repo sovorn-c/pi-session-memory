@@ -1,0 +1,10 @@
+{
+  "name": "pi-session-memory",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Pi extension that keeps small, source-linked memories of a coding session.",
+  "keywords": ["pi-package"],
+  "pi": { "extensions": ["./src/extension.ts"] },
+  "peerDependencies": { "@earendil-works/pi-coding-agent": "*" }
+}

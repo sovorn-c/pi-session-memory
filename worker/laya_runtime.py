@@ -1,5 +1,6 @@
-"""Pinned Laya decision adapter used by both the JSONL worker and quality check."""
+"""Pinned Laya decision adapter used by the JSONL worker."""
 
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import hashlib
 import importlib.metadata
@@ -21,11 +22,9 @@ from worker.protocol import Gate, GateDecision, GateRequest, ProjectionDecision
 LAYA_SOURCE_COMMIT = "010bacef009c855ccba814b51f7c8e1d38ab5e3f"
 CHECKPOINT_REVISION = "f9ab0b228f0fc0f14d873dbc99038f135c2da1b2"
 CHECKPOINT_SHA256 = "4fa56de72383a9d3efa9cfa78955733c81b9fc8067a587ca4beb82c78107a24e"
-DEFAULT_CHECKPOINT = (
-    Path.home()
-    / ".cache/pi-session-memory/bp-init-laya-010bacef/hf/hub/models--convaiinnovations--laya-typed-decisions/snapshots"
-    / CHECKPOINT_REVISION
-)
+CHECKPOINT_REPO = "models--convaiinnovations--laya-typed-decisions"
+Digest = Callable[[Path], str]
+GitRunner = Callable[[Path, list[str]], subprocess.CompletedProcess[str]]
 Question = dict[str, str | dict[str, str]]
 MAX_PROJECTION_CANDIDATES = 8
 MAX_PROJECTION_NEED_CHARS = 800
@@ -100,41 +99,120 @@ class RuntimeContext:
     warnings: tuple[str, ...]
 
 
-def _verified_checkpoint() -> Path:
-    checkpoint = Path(os.environ.get("PI_SESSION_MEMORY_LAYA_CHECKPOINT", DEFAULT_CHECKPOINT)).expanduser().resolve()
+def _expanded(value: str, home: Path) -> Path:
+    text = os.path.expandvars(value)
+    if text == "~" or text.startswith("~/"):
+        text = f"{home}{text[1:]}"
+    return Path(text)
+
+
+def _env_text(env: Mapping[str, str], name: str) -> str | None:
+    value = env.get(name)
+    if not isinstance(value, str) or value.strip() == "":
+        return None
+    return value
+
+
+def checkpoint_directory(env: Mapping[str, str] | None = None, home: str | Path | None = None) -> Path:
+    if env is None:
+        env = os.environ
+    root = Path(home).expanduser() if home is not None else Path.home()
+    explicit = _env_text(env, "PI_SESSION_MEMORY_LAYA_CHECKPOINT")
+    if explicit is not None:
+        return _expanded(explicit, root)
+    hub = _env_text(env, "HF_HUB_CACHE")
+    if hub is None:
+        hf_home = _env_text(env, "HF_HOME")
+        if hf_home is not None:
+            hub_path = _expanded(hf_home, root) / "hub"
+        else:
+            xdg = _env_text(env, "XDG_CACHE_HOME")
+            cache_home = _expanded(xdg, root) if xdg is not None else root / ".cache"
+            hub_path = cache_home / "huggingface" / "hub"
+    else:
+        hub_path = _expanded(hub, root)
+    return hub_path / CHECKPOINT_REPO / "snapshots" / CHECKPOINT_REVISION
+
+
+def _sha256(path: Path) -> str:
+    with path.open("rb") as source:
+        return hashlib.file_digest(source, "sha256").hexdigest()
+
+
+def _verified_checkpoint(
+    env: Mapping[str, str] | None = None,
+    home: str | Path | None = None,
+    digest: Digest | None = None,
+) -> Path:
+    checkpoint = checkpoint_directory(env, home).resolve()
     if checkpoint.name != CHECKPOINT_REVISION:
         raise RuntimeError("checkpoint revision mismatch")
     weights = checkpoint / "model.safetensors"
-    with weights.open("rb") as source:
-        digest = hashlib.file_digest(source, "sha256").hexdigest()
-    if digest != CHECKPOINT_SHA256:
+    if not weights.is_file():
+        raise RuntimeError(f"checkpoint weights missing: {weights}")
+    if (digest or _sha256)(weights) != CHECKPOINT_SHA256:
         raise RuntimeError("checkpoint weights mismatch")
     return checkpoint
 
 
-def _verified_source(distribution: importlib.metadata.Distribution, loaded_agent_path: Path) -> None:
+def _pinned_commit(commit_id: object) -> bool:
+    if not isinstance(commit_id, str) or len(commit_id) != 40:
+        return False
+    if any(character not in "0123456789abcdefABCDEF" for character in commit_id):
+        return False
+    return commit_id.lower() == LAYA_SOURCE_COMMIT
+
+
+def _accept_vcs(vcs_info: object) -> None:
+    if not isinstance(vcs_info, dict) or vcs_info.get("vcs") != "git":
+        raise RuntimeError("Laya source is not the pinned local checkout")
+    commit_id = vcs_info.get("commit_id") if "commit_id" in vcs_info else None
+    if commit_id is None:
+        raise RuntimeError("Laya source is not the pinned local checkout")
+    if not _pinned_commit(commit_id):
+        raise RuntimeError("Laya source commit mismatch")
+
+
+def _verified_source(
+    distribution: importlib.metadata.Distribution,
+    loaded_agent_path: Path,
+    git_runner: GitRunner | None = None,
+) -> None:
     metadata_text = distribution.read_text("direct_url.json")
     if metadata_text is None:
         raise RuntimeError("Laya source origin is unavailable")
-    source_url = json.loads(metadata_text).get("url")
+    try:
+        payload = json.loads(metadata_text)
+    except json.JSONDecodeError:
+        raise RuntimeError("Laya source origin is unavailable") from None
+    if not isinstance(payload, dict):
+        raise RuntimeError("Laya source is not the pinned local checkout")
+    if "vcs_info" in payload and payload.get("vcs_info") is not None:
+        _accept_vcs(payload.get("vcs_info"))
+        return
+    source_url = payload.get("url")
     parsed_url = urlparse(source_url) if isinstance(source_url, str) else None
     if parsed_url is None or parsed_url.scheme != "file":
         raise RuntimeError("Laya source is not the pinned local checkout")
     source_root = Path(unquote(parsed_url.path)).resolve()
 
-    commit = subprocess.run(
-        ["git", "-C", str(source_root), "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
+    if git_runner is None:
+        commit = subprocess.run(
+            ["git", "-C", str(source_root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        clean = subprocess.run(
+            ["git", "-C", str(source_root), "diff", "--quiet", "HEAD", "--", "laya"],
+            check=False,
+            capture_output=True,
+        )
+    else:
+        commit = git_runner(source_root, ["rev-parse", "HEAD"]).stdout.strip()
+        clean = git_runner(source_root, ["diff", "--quiet", "HEAD", "--", "laya"])
     if commit != LAYA_SOURCE_COMMIT:
         raise RuntimeError("Laya source commit mismatch")
-    clean = subprocess.run(
-        ["git", "-C", str(source_root), "diff", "--quiet", "HEAD", "--", "laya"],
-        check=False,
-        capture_output=True,
-    )
     if clean.returncode != 0:
         raise RuntimeError("Laya source checkout is modified")
 

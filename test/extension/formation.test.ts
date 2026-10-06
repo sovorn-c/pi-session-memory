@@ -1,9 +1,24 @@
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { registerFormation } from "../../src/extension.ts";
+import { configPath } from "../../src/config.ts";
+import { CONFIRM_TITLE as exportedConfirmTitle, DISCLOSURE as exportedDisclosure, registerFormation } from "../../src/formation.ts";
+
+const DISCLOSURE =
+  "Session-derived text and its source entry IDs will be sent to the currently configured Pi model/provider only after a local Laya gate accepts. Laya runs locally. The Pi session remains canonical; generated memories are appended as non-context session entries. Do you allow this for the current session?";
+const CONFIRM_TITLE = "Allow session-memory generation?";
+
+function enableGeneration(root, { generation, observeAfter, reflectAfter }) {
+  mkdirSync(join(root, "pi-session-memory"), { recursive: true });
+  writeFileSync(configPath(root), `${JSON.stringify({
+    generation,
+    observeAfterTokens: observeAfter,
+    reflectAfterTokens: reflectAfter,
+  })}\n`);
+}
 
 const observationType = "pi-session-memory.observation";
 const reflectionType = "pi-session-memory.reflection";
@@ -25,24 +40,28 @@ function rawMessage(id, role, content, inputTokens = 0) {
   return { type: "message", id, parentId: null, timestamp: new Date().toISOString(), message };
 }
 
-function testRuntime({ enabled = false, observeAfter = 1, reflectAfter = 1, gateResults = [], approve = true, onComplete, onGate, useRealWorker = false, timeoutScheduler } = {}) {
+function testRuntime({ enabled = false, observeAfter = 1, reflectAfter = 1, gateResults = [], approve = true, hasUI = true, withdrawDuringConfirm = false, onComplete, onGate, useRealWorker = false, timeoutScheduler } = {}) {
   let branch = [];
   const handlers = new Map();
-  const flags = new Map();
+  const registeredFlags = [];
+  const commands = [];
   const entries = [];
+  const root = mkdtempSync(join(tmpdir(), "pi-session-memory-formation-"));
+  enableGeneration(root, { generation: enabled, observeAfter, reflectAfter });
   const gateRequests = [];
   const providerCalls = [];
   const disclosures = [];
   const notifications = [];
+  const order = [];
   let completionNumber = 0;
   let sessionId = "test-session";
 
   const pi = {
-    registerFlag(name, options) {
-      if (!flags.has(name)) flags.set(name, options.default);
+    registerFlag(name) {
+      registeredFlags.push(name);
     },
-    getFlag(name) {
-      return flags.get(name);
+    getFlag() {
+      throw new Error("flags are gone");
     },
     on(name, handler) {
       handlers.set(name, handler);
@@ -52,13 +71,12 @@ function testRuntime({ enabled = false, observeAfter = 1, reflectAfter = 1, gate
       entries.push(entry);
       branch = [...branch, entry];
     },
+    registerCommand(name, command) {
+      commands.push({ name, command });
+    },
   };
-  if (enabled) flags.set("e01-memory-generation", true);
-  flags.set("e01-observe-after-tokens", String(observeAfter));
-  flags.set("e01-reflect-after-tokens", String(reflectAfter));
-
   const ctx = {
-    hasUI: true,
+    hasUI,
     model: { id: "test-model", provider: "test-provider" },
     sessionManager: {
       getSessionId: () => sessionId,
@@ -66,13 +84,16 @@ function testRuntime({ enabled = false, observeAfter = 1, reflectAfter = 1, gate
     },
     ui: {
       confirm: async (title, message) => {
+        order.push("confirm");
         disclosures.push({ title, message });
+        if (withdrawDuringConfirm) enableGeneration(root, { generation: false, observeAfter, reflectAfter });
         return approve;
       },
       notify: (message, type) => notifications.push({ message, type }),
     },
     modelRegistry: {
       complete: async (model, context) => {
+        order.push("complete");
         providerCalls.push({ model, context });
         completionNumber += 1;
         onComplete?.({ branch, replaceBranch: (next) => { branch = next; }, setSessionId: (next) => { sessionId = next; }, context, model });
@@ -94,7 +115,10 @@ function testRuntime({ enabled = false, observeAfter = 1, reflectAfter = 1, gate
     gateRequests.push(request);
     return onGate ? onGate(request) : gateResults.shift() ?? { accepted: true, p_true: 0.9, confidence: 0.8 };
   };
-  registerFormation(pi, useRealWorker ? { timeoutScheduler } : { evaluateGate });
+  registerFormation(pi, {
+    ...(useRealWorker ? { timeoutScheduler } : { evaluateGate }),
+    agentDir: () => root,
+  });
 
   return {
     entries,
@@ -102,12 +126,16 @@ function testRuntime({ enabled = false, observeAfter = 1, reflectAfter = 1, gate
     providerCalls,
     disclosures,
     notifications,
+    order,
     handlers,
     ctx,
-    flags,
+    root,
+    registeredFlags,
+    commands,
     setBranch(next) { branch = next; },
-    async start() {
-      await handlers.get("session_start")({ type: "session_start", reason: "new" }, ctx);
+    setSessionId(next) { sessionId = next; },
+    async start(reason = "new") {
+      await handlers.get("session_start")({ type: "session_start", reason }, ctx);
     },
     async switchSession(nextSessionId) {
       sessionId = nextSessionId;
@@ -717,4 +745,241 @@ test("a reflection with a supporting observation removed from the active branch 
   assert.deepEqual(runtime.gateRequests.map(({ gate }) => gate), ["reflection"]);
   assert.equal(runtime.providerCalls.length, 1);
   assert.equal(runtime.entries.length, 0);
+});
+
+test("an enabled session with no UI sends nothing", async () => {
+  const runtime = testRuntime({ enabled: true, hasUI: false });
+  await runtime.start();
+  await runtime.turn({ userId: "user-no-ui", assistantId: "assistant-no-ui", userText: "A durable synthetic decision.", inputTokens: 1 });
+
+  assert.equal(runtime.providerCalls.length, 0);
+  assert.equal(runtime.entries.length, 0);
+  assert.equal(runtime.disclosures.length, 0);
+});
+
+test("withdrawing enablement while the confirm is pending sends nothing", async () => {
+  const runtime = testRuntime({ enabled: true, withdrawDuringConfirm: true, approve: true });
+  await runtime.start();
+  await runtime.turn({ userId: "user-withdrawn", assistantId: "assistant-withdrawn", userText: "A durable synthetic decision.", inputTokens: 1 });
+
+  assert.equal(runtime.disclosures.length, 1);
+  assert.equal(runtime.providerCalls.length, 0);
+  assert.equal(runtime.entries.length, 0);
+});
+
+test("an approved session confirms once with the exact disclosure and asks again after new and fork", async () => {
+  const runtime = testRuntime({
+    enabled: true,
+    observeAfter: 1,
+    reflectAfter: 1_000_000,
+    onGate: (request) => request.gate === "supersession"
+      ? { accepted: false, p_true: 0.1, confidence: 0.9 }
+      : { accepted: true, p_true: 0.9, confidence: 0.8 },
+  });
+  await runtime.start("new");
+  await runtime.turn({ userId: "user-1", assistantId: "assistant-1", userText: "First durable synthetic decision.", inputTokens: 10 });
+  await runtime.turn({ userId: "user-2", assistantId: "assistant-2", userText: "Second durable synthetic decision.", inputTokens: 30 });
+
+  assert.equal(runtime.disclosures.length, 1);
+  assert.equal(exportedDisclosure, DISCLOSURE);
+  assert.equal(exportedConfirmTitle, CONFIRM_TITLE);
+  assert.equal(runtime.disclosures[0].title, CONFIRM_TITLE);
+  assert.equal(runtime.disclosures[0].message, DISCLOSURE);
+  assert.deepEqual(runtime.registeredFlags, []);
+  assert.deepEqual(runtime.order.slice(0, 2), ["confirm", "complete"]);
+  assert.equal(runtime.providerCalls.length, 2);
+  assert.equal(runtime.entries.length, 2);
+
+  await runtime.start("new");
+  await runtime.turn({ userId: "user-3", assistantId: "assistant-3", userText: "Third durable synthetic decision.", inputTokens: 50 });
+  assert.equal(runtime.disclosures.length, 2);
+  assert.equal(runtime.disclosures[1].message, DISCLOSURE);
+  assert.equal(runtime.providerCalls.length, 3);
+
+  await runtime.start("fork");
+  await runtime.turn({ userId: "user-4", assistantId: "assistant-4", userText: "Fourth durable synthetic decision.", inputTokens: 80 });
+  assert.equal(runtime.disclosures.length, 3);
+  assert.equal(runtime.disclosures[2].message, DISCLOSURE);
+  assert.equal(runtime.providerCalls.length, 4);
+  assert.equal(runtime.entries.length, 4);
+});
+
+test("factory, session start, and a turn with no due gate never launch the worker", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-session-memory-launch-"));
+  const marker = join(root, "launched");
+  const script = join(root, "python");
+  const previous = process.env.PI_SESSION_MEMORY_PYTHON;
+  try {
+    await writeFile(script, `#!/bin/sh\nprintf launched > ${JSON.stringify(marker)}\n`);
+    await chmod(script, 0o755);
+    process.env.PI_SESSION_MEMORY_PYTHON = script;
+    const runtime = testRuntime({ enabled: true, observeAfter: 100_000, reflectAfter: 100_000, useRealWorker: true });
+    await runtime.start();
+    await runtime.turn({ userId: "user-idle", assistantId: "assistant-idle", userText: "Nothing is due yet.", inputTokens: 1 });
+    await assert.rejects(readFile(marker, "utf8"));
+    assert.equal(runtime.providerCalls.length, 0);
+    assert.equal(runtime.entries.length, 0);
+  } finally {
+    if (previous === undefined) delete process.env.PI_SESSION_MEMORY_PYTHON;
+    else process.env.PI_SESSION_MEMORY_PYTHON = previous;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("missing, malformed, and generation-false configs send nothing on a due gate", async () => {
+  const cases = [
+    (root) => rmSync(join(root, "pi-session-memory"), { recursive: true, force: true }),
+    (root) => writeFileSync(configPath(root), "{"),
+    (root) => enableGeneration(root, { generation: false, observeAfter: 1, reflectAfter: 1 }),
+  ];
+  for (const setup of cases) {
+    const runtime = testRuntime({ enabled: true, observeAfter: 1, reflectAfter: 1_000_000 });
+    setup(runtime.root);
+    await runtime.start();
+    await runtime.turn({ userId: "user-off", assistantId: "assistant-off", userText: "A durable synthetic decision.", inputTokens: 10_000 });
+    assert.equal(runtime.gateRequests[0]?.gate, "observation");
+    assert.equal(runtime.providerCalls.length, 0);
+    assert.equal(runtime.entries.length, 0);
+    assert.equal(runtime.disclosures.length, 0);
+  }
+});
+
+test("an unusable config warns once with a UI and stays silent without one or when the file is missing", async () => {
+  const warned = testRuntime({ enabled: false });
+  writeFileSync(configPath(warned.root), "{");
+  await warned.start();
+  await warned.start("resume");
+  assert.equal(warned.notifications.length, 1);
+  assert.equal(warned.notifications[0].type, "warning");
+  assert.match(warned.notifications[0].message, /malformed JSON/);
+  assert.match(warned.notifications[0].message, /config\.json/);
+
+  const quiet = testRuntime({ enabled: false, hasUI: false });
+  writeFileSync(configPath(quiet.root), "{");
+  await quiet.start();
+  assert.deepEqual(quiet.notifications, []);
+
+  const missing = testRuntime({ enabled: false });
+  rmSync(join(missing.root, "pi-session-memory"), { recursive: true, force: true });
+  await missing.start();
+  assert.deepEqual(missing.notifications, []);
+});
+
+test("a session on toggle is not consent, and off revokes it", async () => {
+  const runtime = testRuntime({
+    enabled: false,
+    observeAfter: 1,
+    reflectAfter: 1_000_000,
+    onGate: (request) => request.gate === "supersession"
+      ? { accepted: false, p_true: 0.1, confidence: 0.9 }
+      : { accepted: true, p_true: 0.9, confidence: 0.8 },
+  });
+  const command = runtime.commands[0].command;
+  await runtime.start();
+  await command.handler("on", runtime.ctx);
+  assert.equal(runtime.disclosures.length, 0);
+  assert.equal(runtime.providerCalls.length, 0);
+  assert.match(runtime.notifications.at(-1).message, /on \(session\)/);
+
+  await runtime.turn({ userId: "user-on", assistantId: "assistant-on", userText: "A durable synthetic decision.", inputTokens: 10 });
+  assert.equal(runtime.disclosures.length, 1);
+  assert.equal(runtime.disclosures[0].message, DISCLOSURE);
+  assert.equal(runtime.providerCalls.length, 1);
+
+  await command.handler("off", runtime.ctx);
+  await runtime.turn({ userId: "user-off", assistantId: "assistant-off", userText: "Another durable synthetic decision.", inputTokens: 40 });
+  assert.equal(runtime.providerCalls.length, 1);
+  assert.match(runtime.notifications.at(-1).message, /off \(session\)/);
+
+  const quiet = testRuntime({ enabled: false, hasUI: false });
+  await quiet.start();
+  await quiet.commands[0].command.handler("on", quiet.ctx);
+  await quiet.turn({ userId: "user-quiet", assistantId: "assistant-quiet", userText: "A durable synthetic decision.", inputTokens: 10 });
+  assert.equal(quiet.disclosures.length, 0);
+  assert.equal(quiet.providerCalls.length, 0);
+  assert.match(quiet.notifications.at(-1).message, /nothing changed/);
+});
+
+test("session generation follows on, off, decline, and session boundaries", async () => {
+  const runtime = testRuntime({
+    enabled: false,
+    observeAfter: 1,
+    reflectAfter: 1_000_000,
+    approve: false,
+    onGate: () => ({ accepted: true, p_true: 0.9, confidence: 0.8 }),
+  });
+  const command = runtime.commands[0].command;
+  const before = runtime.root;
+  await runtime.start();
+  await runtime.turn({ userId: "user-default", assistantId: "assistant-default", userText: "A durable synthetic decision.", inputTokens: 10 });
+  assert.equal(runtime.providerCalls.length, 0);
+  assert.equal(runtime.disclosures.length, 0);
+
+  await command.handler("on", runtime.ctx);
+  assert.equal(runtime.disclosures.length, 0);
+  await runtime.turn({ userId: "user-declined", assistantId: "assistant-declined", userText: "A durable synthetic decision.", inputTokens: 30 });
+  assert.equal(runtime.disclosures.length, 1);
+  assert.equal(runtime.providerCalls.length, 0);
+
+  runtime.ctx.ui.confirm = async (title, message) => {
+    runtime.disclosures.push({ title, message });
+    return true;
+  };
+  await runtime.turn({ userId: "user-again", assistantId: "assistant-again", userText: "A durable synthetic decision.", inputTokens: 50 });
+  assert.equal(runtime.disclosures.length, 2);
+  assert.equal(runtime.providerCalls.length, 1);
+  await runtime.turn({ userId: "user-kept", assistantId: "assistant-kept", userText: "A durable synthetic decision.", inputTokens: 70 });
+  assert.equal(runtime.disclosures.length, 2);
+  assert.equal(runtime.providerCalls.length, 2);
+
+  await runtime.start("new");
+  await command.handler("on", runtime.ctx);
+  runtime.ctx.ui.confirm = async () => {
+    await command.handler("off", runtime.ctx);
+    return true;
+  };
+  await runtime.turn({ userId: "user-withdraw", assistantId: "assistant-withdraw", userText: "A durable synthetic decision.", inputTokens: 90 });
+  assert.equal(runtime.providerCalls.length, 2);
+
+  runtime.ctx.ui.confirm = async (title, message) => {
+    runtime.disclosures.push({ title, message });
+    return true;
+  };
+  await command.handler("on", runtime.ctx);
+  await runtime.turn({ userId: "user-reon", assistantId: "assistant-reon", userText: "A durable synthetic decision.", inputTokens: 120 });
+  assert.equal(runtime.disclosures.length, 3);
+  assert.equal(runtime.providerCalls.length, 3);
+  assert.equal(runtime.entries.every((entry) => entry.customType !== "command"), true);
+
+  await command.handler("on", runtime.ctx);
+  runtime.setSessionId("other-session");
+  await runtime.turn({ userId: "user-other", assistantId: "assistant-other", userText: "A durable synthetic decision.", inputTokens: 200 });
+  assert.equal(runtime.providerCalls.length, 3);
+  runtime.setSessionId("test-session");
+  await runtime.start("resume");
+  await runtime.turn({ userId: "user-resume", assistantId: "assistant-resume", userText: "A durable synthetic decision.", inputTokens: 400 });
+  assert.equal(runtime.providerCalls.length, 3);
+  assert.equal(runtime.disclosures.length, 3);
+
+  await runtime.start("fork");
+  await command.handler("on", runtime.ctx);
+  await runtime.start("fork");
+  await runtime.turn({ userId: "user-fork", assistantId: "assistant-fork", userText: "A durable synthetic decision.", inputTokens: 600 });
+  assert.equal(runtime.providerCalls.length, 3);
+  assert.equal(runtime.disclosures.length, 3);
+  assert.equal(before, runtime.root);
+});
+
+test("config generation yields to a session off and still asks after a later on", async () => {
+  const runtime = testRuntime({ enabled: true, observeAfter: 1, reflectAfter: 1_000_000 });
+  const command = runtime.commands[0].command;
+  await runtime.start();
+  await command.handler("off", runtime.ctx);
+  await runtime.turn({ userId: "user-config-off", assistantId: "assistant-config-off", userText: "A durable synthetic decision.", inputTokens: 10 });
+  assert.equal(runtime.disclosures.length, 0);
+  assert.equal(runtime.providerCalls.length, 0);
+  await command.handler("on", runtime.ctx);
+  await runtime.turn({ userId: "user-config-on", assistantId: "assistant-config-on", userText: "A durable synthetic decision.", inputTokens: 40 });
+  assert.equal(runtime.disclosures.length, 1);
+  assert.equal(runtime.providerCalls.length, 1);
 });

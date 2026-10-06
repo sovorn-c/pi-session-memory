@@ -3,12 +3,15 @@ import { supersessionStatuses } from "./supersession.ts";
 
 const OBSERVATION_TYPE = "pi-session-memory.observation";
 const REFLECTION_TYPE = "pi-session-memory.reflection";
-const CANDIDATE_LIMIT_FLAG = "e01-memory-candidates";
-const PROJECTION_LIMIT_FLAG = "e01-memory-projection-chars";
 const MAX_CANDIDATES = 8;
-const DEFAULT_CANDIDATES = 6;
+export const CANDIDATES = 6;
 const MAX_PROJECTION_CHARS = 6_000;
-const DEFAULT_PROJECTION_CHARS = 4_000;
+export const PROJECTION_CHARS = 4_000;
+
+export interface ProjectionLimits {
+  candidates: number;
+  chars: number;
+}
 const MAX_NEED_CHARS = 800;
 const MAX_CANDIDATE_TEXT_CHARS = 500;
 const MAX_GATE_STATE_BYTES = 8_000;
@@ -60,18 +63,7 @@ interface Candidate {
   branchIndex: number;
 }
 type Resident = Pick<Candidate, "entryId" | "kind" | "text">;
-export function registerProjection(pi: ExtensionAPI, evaluate: EvaluateProjection): () => void {
-  pi.registerFlag(CANDIDATE_LIMIT_FLAG, {
-    type: "string",
-    default: String(DEFAULT_CANDIDATES),
-    description: "Maximum active-branch semantic candidates sent to the local Laya selector (1–8).",
-  });
-  pi.registerFlag(PROJECTION_LIMIT_FLAG, {
-    type: "string",
-    default: String(DEFAULT_PROJECTION_CHARS),
-    description: "Maximum characters in one request-local session-memory projection (1–6000).",
-  });
-
+export function registerProjection(pi: ExtensionAPI, evaluate: EvaluateProjection, limits: ProjectionLimits = { candidates: CANDIDATES, chars: PROJECTION_CHARS }): () => void {
   const residents = new Map<string, Resident>();
   pi.on("context", async (event, ctx) => {
     try {
@@ -80,9 +72,8 @@ export function registerProjection(pi: ExtensionAPI, evaluate: EvaluateProjectio
       const originalMessages = event.messages;
       const latestUserText = lastUserText(originalMessages);
       if (!latestUserText) return { messages: originalMessages };
-      const limit = configuredBound(pi.getFlag(CANDIDATE_LIMIT_FLAG), DEFAULT_CANDIDATES, MAX_CANDIDATES);
-      const outputLimit = configuredBound(pi.getFlag(PROJECTION_LIMIT_FLAG), DEFAULT_PROJECTION_CHARS, MAX_PROJECTION_CHARS);
-      if (limit === undefined || outputLimit === undefined) return { messages: originalMessages };
+      const limit = boundedLimit(limits.candidates, CANDIDATES, MAX_CANDIDATES);
+      const outputLimit = boundedLimit(limits.chars, PROJECTION_CHARS, MAX_PROJECTION_CHARS);
 
       let candidates = currentCandidates(branch);
       const currentTerms = words(latestUserText);
@@ -286,10 +277,8 @@ function encodeState(value: unknown): string | undefined {
   return Buffer.byteLength(state, "utf8") <= MAX_GATE_STATE_BYTES ? state : undefined;
 }
 
-function configuredBound(value: boolean | string | undefined, fallback: number, maximum: number): number | undefined {
-  if (typeof value !== "string" || !/^\d+$/.test(value)) return undefined;
-  const parsed = Number(value);
-  return Number.isSafeInteger(parsed) && parsed > 0 && parsed <= maximum ? parsed : undefined;
+function boundedLimit(value: number, fallback: number, maximum: number): number {
+  return Number.isSafeInteger(value) && value >= 1 && value <= maximum ? value : fallback;
 }
 
 function words(text: string): Set<string> {

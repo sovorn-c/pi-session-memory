@@ -16,7 +16,7 @@ async function importPi(relativePath) {
   return import(pathToFileURL(piFile(relativePath)).href);
 }
 
-test("installed Pi exposes the e01 extension API contract", async () => {
+test("installed Pi exposes the extension API contract", async () => {
   const packageMetadata = JSON.parse(readFileSync(piFile("package.json"), "utf8")) as { version: string };
   const extensionTypes = readFileSync(piFile("dist/core/extensions/types.d.ts"), "utf8");
   const modelRegistryTypes = readFileSync(piFile("dist/core/model-registry.d.ts"), "utf8");

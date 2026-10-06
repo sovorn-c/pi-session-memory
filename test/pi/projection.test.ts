@@ -5,19 +5,37 @@ import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { test } from "node:test";
-import extensionFactory from "../../src/extension.ts";
+import { registerFormation } from "../../src/formation.ts";
+import { registerHydration } from "../../src/hydration.ts";
 import { currentCandidates } from "../../src/projection.ts";
+import { layaTestEnv } from "../support/laya-env.ts";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const piExecutable = execFileSync("which", ["pi"], { encoding: "utf8" }).trim();
 const piRoot = resolve(dirname(await realpath(piExecutable)), "../..");
-const pinnedPython = "/Users/sovorn/.cache/pi-session-memory/bp-init-laya-010bacef/bin/python";
+const laya = layaTestEnv();
+const pinnedPython = laya.ready ? laya.python : "";
+const layaSkip = laya.ready ? false : laya.reason;
+
+function applyOfflineLayaEnv(): void {
+  if (!laya.ready) return;
+  process.env.PI_SESSION_MEMORY_LAYA_CHECKPOINT = laya.env.PI_SESSION_MEMORY_LAYA_CHECKPOINT;
+  if (laya.env.HF_HOME) process.env.HF_HOME = laya.env.HF_HOME;
+  else delete process.env.HF_HOME;
+  if (laya.env.HF_HUB_CACHE) process.env.HF_HUB_CACHE = laya.env.HF_HUB_CACHE;
+  else delete process.env.HF_HUB_CACHE;
+  process.env.HF_HUB_OFFLINE = laya.env.HF_HUB_OFFLINE;
+  process.env.TRANSFORMERS_OFFLINE = laya.env.TRANSFORMERS_OFFLINE;
+  process.env.USE_TF = laya.env.USE_TF;
+  process.env.TOKENIZERS_PARALLELISM = laya.env.TOKENIZERS_PARALLELISM;
+  process.env.PYTHONDONTWRITEBYTECODE = "1";
+}
 
 async function importPi(relativePath: string) {
   return import(pathToFileURL(resolve(piRoot, relativePath)).href);
 }
 
-test("installed Pi context keeps native requests unchanged and adds only Laya-selected request-local memory", { timeout: 180_000 }, async (t) => {
+test("installed Pi context keeps native requests unchanged and adds only Laya-selected request-local memory", { timeout: 180_000, skip: layaSkip }, async (t) => {
   const sessionDir = await mkdtemp(resolve(tmpdir(), "pi-session-memory-projection-"));
   const previousPython = process.env.PI_SESSION_MEMORY_PYTHON;
   const previousHFHome = process.env.HF_HOME;
@@ -84,17 +102,15 @@ test("installed Pi context keeps native requests unchanged and adds only Laya-se
   assert.equal(relative(sessionRoot, resolvedSessionFile).startsWith(`..${sep}`), false);
 
   process.env.PI_SESSION_MEMORY_PYTHON = pinnedPython;
-  process.env.HF_HOME = "/Users/sovorn/.cache/pi-session-memory/bp-init-laya-010bacef/hf";
-  process.env.HF_HUB_OFFLINE = "1";
-  process.env.TRANSFORMERS_OFFLINE = "1";
-  process.env.USE_TF = "0";
-  process.env.TOKENIZERS_PARALLELISM = "false";
-  process.env.PYTHONDONTWRITEBYTECODE = "1";
+  applyOfflineLayaEnv();
 
   const extensionRuntime = createExtensionRuntime();
   extensionRuntime.refreshTools = () => {};
   const loadedExtension = await loadExtensionFromFactory(
-    (pi) => extensionFactory(pi),
+    (pi) => {
+      registerFormation(pi, { agentDir: () => sessionDir });
+      registerHydration(pi);
+    },
     projectRoot,
     createEventBus(),
     extensionRuntime,
@@ -138,8 +154,8 @@ test("installed Pi context keeps native requests unchanged and adds only Laya-se
   assert.equal(providerCalls, 0, "the context test must not call the configured provider");
 });
 
-test("SC-e03s01-P1-04: installed Pi with real offline Laya exercises labeled observation and reflection among decoys with zero provider calls", { timeout: 180_000 }, async (t) => {
-  const sessionDir = await mkdtemp(resolve(tmpdir(), "pi-session-memory-e03s01-"));
+test("installed Pi with real offline Laya exercises labeled observation and reflection among decoys with zero provider calls", { timeout: 180_000, skip: layaSkip }, async (t) => {
+  const sessionDir = await mkdtemp(resolve(tmpdir(), "pi-session-memory-projection-"));
   const previousPython = process.env.PI_SESSION_MEMORY_PYTHON;
   const previousHFHome = process.env.HF_HOME;
   const previousHFOffline = process.env.HF_HUB_OFFLINE;
@@ -348,18 +364,17 @@ finally:
     { mode: 0o755 }
   );
 
+  applyOfflineLayaEnv();
   process.env.PI_SESSION_MEMORY_PYTHON = recorderScriptPath;
   process.env.PI_RECORDER_LOG = recorderLogPath;
-  process.env.HF_HOME = "/Users/sovorn/.cache/pi-session-memory/bp-init-laya-010bacef/hf";
-  process.env.HF_HUB_OFFLINE = "1";
-  process.env.TRANSFORMERS_OFFLINE = "1";
-  process.env.USE_TF = "0";
-  process.env.TOKENIZERS_PARALLELISM = "false";
 
   const extensionRuntime = createExtensionRuntime();
   extensionRuntime.refreshTools = () => {};
   const loadedExtension = await loadExtensionFromFactory(
-    (pi) => extensionFactory(pi),
+    (pi) => {
+      registerFormation(pi, { agentDir: () => sessionDir });
+      registerHydration(pi);
+    },
     projectRoot,
     createEventBus(),
     extensionRuntime,
@@ -534,7 +549,7 @@ finally:
   });
 
   // Output findings for report collection
-  console.log("\n=== e03s01 Real Pinned Laya Offline Residency Findings ===");
+  console.log("\n=== projection Real Pinned Laya Offline Residency Findings ===");
   for (const f of findings) {
     console.log(`[${f.caseLabel}] expected=${f.expectedId}, poolInclusion=${f.poolInclusion}, gateInclusion=${f.gateInclusion}, gateCandidates=[${f.gateCandidateIds.join(", ")}], selected=${f.selectedId}, chars=${f.renderedChars}, disposition=${f.disposition}`);
   }
