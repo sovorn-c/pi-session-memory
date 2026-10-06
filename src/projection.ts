@@ -87,26 +87,26 @@ export function registerProjection(pi: ExtensionAPI, evaluate: EvaluateProjectio
       let candidates = currentCandidates(branch);
       const currentTerms = words(latestUserText);
       const memoryNeed = needsMemory(latestUserText, currentTerms, candidates);
-      if (!memoryNeed) return { messages: originalMessages };
+      if (!memoryNeed) return { messages: withoutMemoryProjections(originalMessages) };
 
       const residentId = residents.get(sessionId)?.entryId;
       if (residentId) {
         const resident = candidateById(branch, residentId);
         if (resident) {
           const state = encodeState({ need: truncate(latestUserText, MAX_NEED_CHARS), candidate: { entryId: resident.entryId, kind: resident.kind, text: resident.text } });
-          if (!state) return { messages: originalMessages };
+          if (!state) return { messages: withoutMemoryProjections(originalMessages) };
           const decision = await evaluate(sessionId, { gate: "resident", state }, ctx);
           const currentBranch = ctx.sessionManager.getBranch();
-          if (ctx.sessionManager.getSessionId() !== sessionId) return { messages: originalMessages };
+          if (ctx.sessionManager.getSessionId() !== sessionId) return { messages: withoutMemoryProjections(originalMessages) };
           const currentResident = candidateById(currentBranch, resident.entryId);
           if (!currentResident || currentResident.text !== resident.text || currentResident.kind !== resident.kind) {
             residents.delete(sessionId);
-            return { messages: originalMessages };
+            return { messages: withoutMemoryProjections(originalMessages) };
           }
-          if (!isSufficiencyDecision(decision)) return { messages: originalMessages };
+          if (!isSufficiencyDecision(decision)) return { messages: withoutMemoryProjections(originalMessages) };
           if (decision.accepted) {
             const text = renderCandidate(currentResident);
-            if (text.length > outputLimit) return { messages: originalMessages };
+            if (text.length > outputLimit) return { messages: withoutMemoryProjections(originalMessages) };
             residents.set(sessionId, asResident(currentResident));
             return { messages: withProjection(originalMessages, text) };
           }
@@ -121,28 +121,28 @@ export function registerProjection(pi: ExtensionAPI, evaluate: EvaluateProjectio
         .sort((left, right) => right.score - left.score || right.candidate.branchIndex - left.candidate.branchIndex)
         .slice(0, limit)
         .map(({ candidate }) => candidate);
-      if (ranked.length === 0) return { messages: originalMessages };
+      if (ranked.length === 0) return { messages: withoutMemoryProjections(originalMessages) };
 
       const state = encodeState({
         need: truncate(latestUserText, MAX_NEED_CHARS),
         candidates: ranked.map(({ entryId, kind, text }) => ({ entryId, kind, text: truncate(text, MAX_CANDIDATE_TEXT_CHARS) })),
       });
-      if (!state) return { messages: originalMessages };
+      if (!state) return { messages: withoutMemoryProjections(originalMessages) };
       const selection = await evaluate(sessionId, { gate: "projection", state }, ctx);
-      if (!isSelectionDecision(selection) || selection.selected_entry_id === null) return { messages: originalMessages };
+      if (!isSelectionDecision(selection) || selection.selected_entry_id === null) return { messages: withoutMemoryProjections(originalMessages) };
       const selected = ranked.find(({ entryId }) => entryId === selection.selected_entry_id);
-      if (!selected) return { messages: originalMessages };
+      if (!selected) return { messages: withoutMemoryProjections(originalMessages) };
 
       const currentBranch = ctx.sessionManager.getBranch();
-      if (ctx.sessionManager.getSessionId() !== sessionId) return { messages: originalMessages };
+      if (ctx.sessionManager.getSessionId() !== sessionId) return { messages: withoutMemoryProjections(originalMessages) };
       const revalidated = candidateById(currentBranch, selected.entryId);
-      if (!revalidated || revalidated.text !== selected.text || revalidated.kind !== selected.kind) return { messages: originalMessages };
+      if (!revalidated || revalidated.text !== selected.text || revalidated.kind !== selected.kind) return { messages: withoutMemoryProjections(originalMessages) };
       const text = renderCandidate(revalidated);
-      if (text.length > outputLimit) return { messages: originalMessages };
+      if (text.length > outputLimit) return { messages: withoutMemoryProjections(originalMessages) };
       residents.set(sessionId, asResident(revalidated));
       return { messages: withProjection(originalMessages, text) };
     } catch {
-      return { messages: event.messages };
+      return { messages: withoutMemoryProjections(event.messages) };
     }
   });
 
@@ -255,21 +255,30 @@ function renderCandidate(candidate: Candidate): string {
   return `${MEMORY_LABEL}\n[${candidate.kind} ${candidate.entryId}] ${candidate.text}${links ? `\n${links}` : ""}`;
 }
 
+function isMemoryProjectionMessage(message: ContextMessages[number]): boolean {
+  return message.role === "user" && messageText(message).startsWith(MEMORY_LABEL);
+}
+
+function withoutMemoryProjections(messages: ContextMessages): ContextMessages {
+  return messages.filter((message) => !isMemoryProjectionMessage(message));
+}
+
 function withProjection(messages: ContextMessages, text: string): ContextMessages {
+  const base = withoutMemoryProjections(messages);
   let requestStart = -1;
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    if (messages[index].role === "user") {
+  for (let index = base.length - 1; index >= 0; index -= 1) {
+    if (base[index].role === "user") {
       requestStart = index;
       break;
     }
   }
-  if (requestStart < 0) return messages;
+  if (requestStart < 0) return base;
   const projection = {
     role: "user" as const,
     content: [{ type: "text" as const, text }],
     timestamp: Date.now(),
   };
-  return [...messages.slice(0, requestStart), projection, ...messages.slice(requestStart)];
+  return [...base.slice(0, requestStart), projection, ...base.slice(requestStart)];
 }
 
 function encodeState(value: unknown): string | undefined {

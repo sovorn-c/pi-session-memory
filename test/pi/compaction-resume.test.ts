@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { StringDecoder } from "node:string_decoder";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
@@ -13,6 +13,57 @@ const realPiOptIn = process.env.PI_SESSION_MEMORY_E01_REAL_PI === "1";
 const workerMarkerVariable = "PI_SESSION_MEMORY_E01_WORKER_MARKER";
 const projectionLabel = "Relevant prior session memory";
 const missingObservationId = "e01s04-missing-observation-not-on-active-branch";
+const pinnedPythonDefault = "/Users/sovorn/.cache/pi-session-memory/bp-init-laya-010bacef/bin/python";
+const E03_CONTINUATION_TASK_PROMPT =
+  "Continue the earlier branch-lookup fix. Identify the smallest change, give its patch and explain why the rejected global lookup approach is wrong. Use the project and earlier evidence if needed; do not modify files.";
+const E03_PRELABELED_ORACLE = {
+  expectedFix:
+    "The smallest change keeps append-only active-branch lookup in the session manager rather than replacing canonical Pi history with a global or external store.",
+  rejectedApproach:
+    "A global or external lookup store that replaces canonical Pi session history and bypasses active-branch provenance.",
+  preservedConstraint: "Canonical Pi session history stays append-only with exact active-branch source links.",
+};
+const E03_MAX_PROVIDER_STARTS = 9;
+const E03_ARM_DEADLINE_MS = 300_000;
+const E03_TRIAL_DEADLINE_MS = 900_000;
+const E03_MAX_INFERENCES_PER_ARM = 4;
+const E03_RECORDER_ALLOWED_LOG_KEYS = new Set([
+  "gate",
+  "request_id",
+  "candidate_ids",
+  "selected_entry_id",
+  "accepted",
+  "state_bytes",
+  "elapsed_ms",
+]);
+
+interface PiRpcLaunchOptions {
+  workerPython?: string;
+  includeMemoryExtension?: boolean;
+  tools?: string;
+  excludeTools?: string;
+  systemPrompt?: string;
+  env?: Record<string, string>;
+}
+
+interface E03TrialReadiness {
+  status: "ready";
+}
+
+interface E03TrialBlocked {
+  status: "blocked";
+  reason: string;
+}
+
+type E03TrialGate = E03TrialReadiness | E03TrialBlocked;
+
+interface E03ContinuationOracleScore {
+  addressesActiveBranchPatch: boolean;
+  explainsCanonicalHistoryConstraint: boolean;
+  rejectsGlobalStoreApproach: boolean;
+  avoidsInventedMemoryIds: boolean;
+  overallCorrect: boolean;
+}
 
 interface RpcRecord {
   [key: string]: unknown;
@@ -51,17 +102,28 @@ class PiRpc {
   readonly notificationRequests: RpcRecord[] = [];
   readonly confirmationRequests: RpcRecord[] = [];
 
-  constructor(piExecutable: string, cwd: string, sessionDir: string, sessionFile: string, observerExtension: string, workerPython?: string) {
+  constructor(
+    piExecutable: string,
+    cwd: string,
+    sessionDir: string,
+    sessionFile: string,
+    observerExtension: string,
+    launch: PiRpcLaunchOptions = {},
+  ) {
     const workerMarker = resolve(dirname(observerExtension), "worker-started.txt");
+    const includeMemoryExtension = launch.includeMemoryExtension !== false;
+    const extensionArgs = ["--no-extensions"];
+    if (includeMemoryExtension) extensionArgs.push("--extension", resolve(projectRoot, "src/extension.ts"));
+    extensionArgs.push("--extension", observerExtension);
+    const workerPython = launch.workerPython;
     this.child = spawn(piExecutable, [
       "--mode", "rpc",
-      "--no-extensions",
-      "--extension", resolve(projectRoot, "src/extension.ts"),
-      "--extension", observerExtension,
+      ...extensionArgs,
       "--session-dir", sessionDir,
       "--session", sessionFile,
-      "--tools", "hydrate_session_memory",
-      "--system-prompt", "Synthetic e01 integration only. Use only the supplied synthetic session entries.",
+      "--tools", launch.tools ?? "hydrate_session_memory",
+      ...(launch.excludeTools ? ["--exclude-tools", launch.excludeTools] : []),
+      "--system-prompt", launch.systemPrompt ?? "Synthetic e01 integration only. Use only the supplied synthetic session entries.",
       ...(process.env.PI_SESSION_MEMORY_E01_MODEL ? ["--model", process.env.PI_SESSION_MEMORY_E01_MODEL] : []),
       "--thinking", process.env.PI_SESSION_MEMORY_E01_THINKING ?? "off",
       "--approve",
@@ -75,6 +137,7 @@ class PiRpc {
         ...process.env,
         PI_TELEMETRY: "0",
         ...(workerPython ? { PI_SESSION_MEMORY_PYTHON: workerPython } : {}),
+        ...(launch.env ?? {}),
         [workerMarkerVariable]: workerMarker,
       },
       stdio: ["pipe", "pipe", "ignore"],
@@ -344,7 +407,7 @@ test("Pi 1.0.2 low-context auto-compaction and same-session resume preserve link
     assert.ok(resumedBranchIds.has(id), "the same active branch must retain each linked synthetic entry after native compaction");
   }
 
-  rpc = new PiRpc(piExecutable, cwd, sessionDir, canonicalSessionFile, observerExtension, workerShim);
+  rpc = new PiRpc(piExecutable, cwd, sessionDir, canonicalSessionFile, observerExtension, { workerPython: workerShim });
   const resumedState = await rpc.command({ type: "get_state" });
   assert.equal(resumedState.success, true, "Pi RPC must resume the same compacted synthetic session");
   assert.ok(isRecord(resumedState.data));
@@ -493,6 +556,671 @@ test("a different session or active branch cannot satisfy same-session resume ac
   }), /resumed active branch must exactly match/);
 });
 
+function evaluateE03TrialReadiness(env: {
+  providerTrial?: string;
+  model?: string;
+  thinking?: string;
+}): E03TrialGate {
+  if (env.providerTrial !== "1") {
+    return { status: "blocked", reason: "BLOCKED_NO_CONSENT" };
+  }
+  if (!env.model?.trim()) {
+    return { status: "blocked", reason: "BLOCKED_MISSING_MODEL" };
+  }
+  if (!env.thinking?.trim()) {
+    return { status: "blocked", reason: "BLOCKED_MISSING_THINKING" };
+  }
+  return { status: "ready" };
+}
+
+function scoreE03ContinuationOracle(answerText: string, allowedMemoryIds: readonly string[] = []): E03ContinuationOracleScore {
+  const text = answerText.toLowerCase();
+  const recommendsGlobalStore =
+    /\b(global|external)\b/.test(text) &&
+    /\b(store|database|cache|redis|lookup table)\b/.test(text) &&
+    !/\b(reject|wrong|avoid|instead of|not)\b/.test(text.slice(0, Math.min(text.length, 400)));
+  const addressesActiveBranchPatch =
+    /\b(active[- ]branch|getbranch|session manager|sessionmanager)\b/.test(text) &&
+    !recommendsGlobalStore;
+  const explainsCanonicalHistoryConstraint =
+    /\b(canonical|append-only|provenance|source link|active branch)\b/.test(text);
+  const rejectsGlobalStoreApproach =
+    /\b(global|external)\b/.test(text) &&
+    /\b(wrong|reject|avoid|breaks|replaces canonical|not replace)\b/.test(text);
+  const inventedIdMention = allowedMemoryIds.some((id) => answerText.includes(id));
+  const suspiciousInventedId = /\b(?:memory|observation|reflection)-[0-9a-f]{6,}\b/i.test(answerText) && !inventedIdMention;
+  const avoidsInventedMemoryIds = !suspiciousInventedId;
+  const overallCorrect = addressesActiveBranchPatch && explainsCanonicalHistoryConstraint && rejectsGlobalStoreApproach && avoidsInventedMemoryIds;
+  return {
+    addressesActiveBranchPatch,
+    explainsCanonicalHistoryConstraint,
+    rejectsGlobalStoreApproach,
+    avoidsInventedMemoryIds,
+    overallCorrect,
+  };
+}
+
+function e03PreTurnFingerprint(entries: unknown[]): string {
+  return JSON.stringify(entries.filter((entry) => !(isRecord(entry) && entry.type === "compaction")));
+}
+
+function assertE03CompactedSeedEquality(leftEntries: unknown[], rightEntries: unknown[]): void {
+  assert.equal(e03PreTurnFingerprint(leftEntries), e03PreTurnFingerprint(rightEntries), "compacted arm seeds must match on pre-turn entries");
+}
+
+class E03ProviderBudget {
+  private starts = 0;
+  private readonly armStarts = new Map<string, number>();
+  private readonly maxStarts: number;
+  private readonly trialStartedAt: number;
+  private readonly trialDeadlineMs: number;
+  private readonly armDeadlineMs: number;
+  private readonly maxPerArm: number;
+
+  constructor(
+    maxStarts = E03_MAX_PROVIDER_STARTS,
+    trialStartedAt = Date.now(),
+    trialDeadlineMs = E03_TRIAL_DEADLINE_MS,
+    armDeadlineMs = E03_ARM_DEADLINE_MS,
+    maxPerArm = E03_MAX_INFERENCES_PER_ARM,
+  ) {
+    this.maxStarts = maxStarts;
+    this.trialStartedAt = trialStartedAt;
+    this.trialDeadlineMs = trialDeadlineMs;
+    this.armDeadlineMs = armDeadlineMs;
+    this.maxPerArm = maxPerArm;
+  }
+
+  recordInferenceStart(arm: string): void {
+    assert.ok(Date.now() - this.trialStartedAt <= this.trialDeadlineMs, "E03 trial exceeded whole-trial deadline");
+    this.starts += 1;
+    assert.ok(this.starts <= this.maxStarts, "E03 trial exceeded provider inference start budget");
+    const next = (this.armStarts.get(arm) ?? 0) + 1;
+    this.armStarts.set(arm, next);
+    assert.ok(next <= this.maxPerArm, `E03 arm ${arm} exceeded per-arm inference budget`);
+  }
+
+  inferenceStartCount(): number {
+    return this.starts;
+  }
+
+  assertArmWallDeadline(arm: string, armStartedAt: number): void {
+    assert.ok(Date.now() - armStartedAt <= this.armDeadlineMs, `E03 arm ${arm} exceeded arm deadline`);
+  }
+}
+
+class E03ArmIsolationRegistry {
+  private readonly responses = new Map<string, string>();
+  private readonly resident = new Map<string, string | null>();
+
+  registerResponse(arm: string, responseKey: string): void {
+    const owner = this.responses.get(responseKey);
+    assert.equal(owner, undefined, "continuation arms must not share generated responses");
+    this.responses.set(responseKey, arm);
+  }
+
+  setResidentState(arm: string, stateKey: string): void {
+    const owner = this.resident.get(stateKey);
+    if (owner !== undefined && owner !== arm) {
+      assert.fail("continuation arms must not share resident state");
+    }
+    this.resident.set(stateKey, arm);
+  }
+}
+
+function assistantMessageEndsWithUsage(records: readonly RpcRecord[]): number {
+  return records.filter((event) => {
+    if (event.type !== "message_end" || !isRecord(event.message)) return false;
+    return isRecord(event.message.usage);
+  }).length;
+}
+
+function chargeInferenceStartsFromRpcRecords(budget: E03ProviderBudget, arm: string, records: readonly RpcRecord[]): number {
+  const count = assistantMessageEndsWithUsage(records);
+  for (let index = 0; index < count; index += 1) budget.recordInferenceStart(arm);
+  return count;
+}
+
+function resolveE03ContinuationOutcome(nativeCorrect: boolean, memoryCorrect: boolean): "benefit" | "harm" | "no-demonstrated-benefit" {
+  if (memoryCorrect && !nativeCorrect) return "benefit";
+  if (!memoryCorrect && nativeCorrect) return "harm";
+  return "no-demonstrated-benefit";
+}
+
+function assertBoundedRecorderLogEntry(entry: unknown): void {
+  assert.ok(isRecord(entry));
+  for (const key of Object.keys(entry)) {
+    assert.ok(E03_RECORDER_ALLOWED_LOG_KEYS.has(key), `recorder log must not include field ${key}`);
+  }
+  assert.equal(typeof entry.state_bytes, "number");
+  assert.ok(entry.state_bytes >= 0);
+  assert.equal("state" in entry, false);
+  assert.equal("credentials" in entry, false);
+}
+
+async function writeTransparentWorkerRecorderScript(recorderScriptPath: string, recorderLogPath: string, pinnedPython: string): Promise<void> {
+  await writeFile(
+    recorderScriptPath,
+    `#!${pinnedPython}
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+
+real_python = ${JSON.stringify(pinnedPython)}
+log_path = os.environ.get("PI_RECORDER_LOG")
+
+proc = subprocess.Popen(
+    [real_python, "-B", "-m", "worker"],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.DEVNULL,
+    text=True,
+    bufsize=1,
+    env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"),
+)
+
+def handle_term(signum, frame):
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, handle_term)
+
+try:
+    for line in sys.stdin:
+        if not line:
+            break
+        gate = None
+        req_id = None
+        candidate_ids = []
+        state_bytes = 0
+        try:
+            req = json.loads(line)
+            gate = req.get("gate")
+            req_id = req.get("request_id")
+            state_str = req.get("state", "")
+            state_bytes = len(state_str.encode("utf-8"))
+            if gate == "projection":
+                state_data = json.loads(state_str)
+                candidate_ids = [c["entryId"] for c in state_data.get("candidates", []) if isinstance(c, dict) and "entryId" in c]
+            elif gate == "resident":
+                state_data = json.loads(state_str)
+                cand = state_data.get("candidate", {})
+                if isinstance(cand, dict) and "entryId" in cand:
+                    candidate_ids = [cand["entryId"]]
+        except Exception:
+            pass
+
+        t0 = time.perf_counter()
+        proc.stdin.write(line)
+        proc.stdin.flush()
+
+        resp_line = proc.stdout.readline()
+        if not resp_line:
+            break
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+        selected_id = None
+        accepted = None
+        try:
+            resp = json.loads(resp_line)
+            decision = resp.get("decision") if isinstance(resp.get("decision"), dict) else resp
+            selected_id = decision.get("selected_entry_id")
+            accepted = decision.get("accepted")
+        except Exception:
+            pass
+
+        if log_path:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "gate": gate,
+                    "request_id": req_id,
+                    "candidate_ids": candidate_ids,
+                    "selected_entry_id": selected_id,
+                    "accepted": accepted,
+                    "state_bytes": state_bytes,
+                    "elapsed_ms": round(elapsed_ms, 2)
+                }) + "\\n")
+
+        sys.stdout.write(resp_line)
+        sys.stdout.flush()
+finally:
+    try:
+        proc.terminate()
+        proc.wait(timeout=2)
+    except Exception:
+        pass
+`,
+    { mode: 0o755 },
+  );
+  assert.match(await readFile(recorderScriptPath, "utf8"), /"-m", "worker"/);
+  assert.equal(recorderLogPath.length > 0, true);
+}
+
+function e03TrialObserverSource(evidenceFile: string, testModel?: SmallContextModelRegistration): string {
+  const registerSmallContextModel = testModel
+    ? `  pi.registerProvider(${JSON.stringify(testModel.provider)}, { models: [${JSON.stringify(testModel.definition)}] });\n`
+    : "";
+  return `import { appendFileSync } from "node:fs";
+export default function (pi) {
+${registerSmallContextModel}
+  pi.on("agent_end", () => {
+    appendFileSync(${JSON.stringify(evidenceFile)}, JSON.stringify({ kind: "inference_start", arm: process.env.PI_SESSION_MEMORY_E03_ARM ?? "unknown" }) + "\\n");
+  });
+}
+`;
+}
+
+async function writeE03TinyProject(projectDir: string): Promise<void> {
+  await mkdir(resolve(projectDir, "src"), { recursive: true });
+  await writeFile(
+    resolve(projectDir, "src/lookup.ts"),
+    `// Synthetic disposable project: active-branch lookup bug (do not treat as production code).
+export function lookupAllEntries(entries: unknown[], id: string): unknown {
+  return entries.find((entry) => isRecord(entry) && entry.id === id);
+}
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+`,
+  );
+  await writeFile(
+    resolve(projectDir, "README.md"),
+    "Synthetic branch-lookup exercise. Prefer append-only active-branch lookup in the session manager; do not replace canonical Pi history with a global store.\n",
+  );
+}
+
+async function seedE03ContinuationSession(
+  SessionManager: { create: (cwd: string, sessionDir: string) => { appendMessage: (message: unknown) => string; appendCustomEntry: (type: string, data: unknown) => string; getSessionFile: () => string; getSessionId: () => string } },
+  cwd: string,
+  sessionDir: string,
+) {
+  await writeE03TinyProject(cwd);
+  const seed = SessionManager.create(cwd, sessionDir);
+  const filler = "Synthetic continuation filler without user data. ".repeat(120);
+  for (let turn = 0; turn < 2; turn += 1) {
+    seed.appendMessage({ role: "user", content: [{ type: "text", text: `${filler} setup turn ${turn}.` }], timestamp: Date.now() + turn });
+    seed.appendMessage(syntheticAssistant(`Synthetic setup acknowledgement ${turn}.`, Date.now() + turn, 8_000));
+  }
+  const rawLookup = seed.appendMessage({
+    role: "user",
+    content: [{ type: "text", text: "We decided to fix append-only active-branch lookup directly in the session manager rather than introducing an external canonical store." }],
+    timestamp: Date.now() + 10,
+  });
+  const observationLookup = seed.appendCustomEntry("pi-session-memory.observation", {
+    schemaVersion: 1,
+    text: "Fix append-only active-branch lookup directly in the session manager rather than introducing an external canonical store.",
+    sourceEntryIds: [rawLookup],
+  });
+  const rawIntegrity = seed.appendMessage({
+    role: "user",
+    content: [{ type: "text", text: "Active-branch lookup must remain append-only and branch-isolated to preserve canonical session integrity during concurrent tool execution." }],
+    timestamp: Date.now() + 11,
+  });
+  seed.appendCustomEntry("pi-session-memory.observation", {
+    schemaVersion: 1,
+    text: "Active-branch lookup must remain append-only and branch-isolated to preserve canonical session integrity.",
+    sourceEntryIds: [rawIntegrity],
+  });
+  seed.appendCustomEntry("pi-session-memory.reflection", {
+    schemaVersion: 1,
+    text: "Architecture rationale: Session state relies on append-only active-branch lookup in the session manager to avoid external storage synchronization risks and protect canonical history.",
+    supportingObservationIds: [observationLookup],
+  });
+  for (let index = 0; index < 6; index += 1) {
+    const rawDecoy = seed.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: `Decoy topic ${index}: typography scale and palette variables.` }],
+      timestamp: Date.now() + 20 + index,
+    });
+    seed.appendCustomEntry("pi-session-memory.observation", {
+      schemaVersion: 1,
+      text: `Decoy note ${index}: typography scale uses modular baseline units.`,
+      sourceEntryIds: [rawDecoy],
+    });
+  }
+  seed.appendMessage(syntheticAssistant("Synthetic branch-lookup session is ready for native compaction.", Date.now() + 40, 20_000));
+  return seed;
+}
+
+async function copySessionSeedForArm(sourceSessionFile: string, armSessionDir: string, armSessionFileName: string): Promise<string> {
+  await mkdir(armSessionDir, { recursive: true });
+  const target = resolve(armSessionDir, armSessionFileName);
+  await copyFile(sourceSessionFile, target);
+  return target;
+}
+
+async function runE03ContinuationArm(options: {
+  arm: "native" | "memory";
+  piExecutable: string;
+  cwd: string;
+  sessionDir: string;
+  sessionFile: string;
+  observerExtension: string;
+  launch: PiRpcLaunchOptions;
+  budget: E03ProviderBudget;
+  isolation: E03ArmIsolationRegistry;
+}): Promise<{ answerText: string; inferenceStarts: number; wallMs: number }> {
+  const armStartedAt = Date.now();
+  const rpc = new PiRpc(options.piExecutable, options.cwd, options.sessionDir, options.sessionFile, options.observerExtension, {
+    ...options.launch,
+    env: { PI_SESSION_MEMORY_E03_ARM: options.arm, ...(options.launch.env ?? {}) },
+  });
+  try {
+    const state = await rpc.command({ type: "get_state" });
+    assert.equal(state.success, true);
+    const cursor = rpc.cursor();
+    const prompt = await rpc.command({ type: "prompt", message: E03_CONTINUATION_TASK_PROMPT }, E03_ARM_DEADLINE_MS);
+    assert.equal(prompt.success, true, `${options.arm} continuation prompt must succeed`);
+    await rpc.waitForEvent(cursor, (event) => event.type === "agent_settled", E03_ARM_DEADLINE_MS);
+    options.budget.assertArmWallDeadline(options.arm, armStartedAt);
+    const armRecords = rpc.recordsSince(cursor);
+    const inferenceStarts = chargeInferenceStartsFromRpcRecords(options.budget, options.arm, armRecords);
+    const assistantTexts = armRecords
+      .flatMap((event) => (event.type === "message_end" && isRecord(event.message) ? [rpcAssistantMessageText(event.message) ?? ""] : []))
+      .filter(Boolean);
+    const answerText = assistantTexts.join("\n");
+    options.isolation.registerResponse(options.arm, options.sessionFile);
+    options.isolation.setResidentState(options.arm, `${options.arm}-resident-${answerText.length}`);
+    return { answerText, inferenceStarts, wallMs: Date.now() - armStartedAt };
+  } finally {
+    await rpc.stop();
+  }
+}
+
+test("E03 continuation compacted seed fixture equality uses matching pre-turn fingerprints", () => {
+  const sharedSeed = [
+    { type: "message", id: "raw-decision-lookup", message: { role: "user", content: [{ type: "text", text: "branch lookup decision" }] } },
+    { type: "custom", id: "observation-branch-lookup", customType: "pi-session-memory.observation" },
+    { type: "compaction", id: "compaction-1", summary: "synthetic compaction summary" },
+  ];
+  const nativeCopy = structuredClone(sharedSeed);
+  const memoryCopy = structuredClone(sharedSeed);
+  assertE03CompactedSeedEquality(nativeCopy, memoryCopy);
+  memoryCopy.push({ type: "message", id: "post-arm-only", message: { role: "assistant", content: [{ type: "text", text: "native arm answer must not appear here during seed copy" }] } });
+  assert.throws(() => assertE03CompactedSeedEquality(nativeCopy, memoryCopy), /compacted arm seeds must match/);
+});
+
+test("E03 continuation result oracle scores the predeclared active-branch patch criteria", () => {
+  tDiagnosticOraclePrelabel();
+  const allowedIds = ["observation-branch-lookup", "raw-decision-lookup"];
+  const good = `
+Smallest fix: adjust append-only active-branch lookup in the session manager getBranch path.
+A global external store is wrong because it replaces canonical Pi history and breaks exact source links on the active branch.
+`;
+  const badGlobal = "Use a global external lookup store indexed by entry id across all sessions.";
+  const goodScore = scoreE03ContinuationOracle(good, allowedIds);
+  const badScore = scoreE03ContinuationOracle(badGlobal, allowedIds);
+  assert.equal(goodScore.overallCorrect, true);
+  assert.equal(badScore.addressesActiveBranchPatch, false);
+  assert.equal(badScore.rejectsGlobalStoreApproach, false);
+});
+
+test("E03 continuation trial guard reports BLOCKED_NO_CONSENT without operator opt-in", () => {
+  const gate = evaluateE03TrialReadiness({});
+  assert.equal(gate.status, "blocked");
+  if (gate.status === "blocked") assert.equal(gate.reason, "BLOCKED_NO_CONSENT");
+});
+
+test("E03 continuation trial guard reports blocked reason when model or thinking is missing", () => {
+  const missingModel = evaluateE03TrialReadiness({ providerTrial: "1", model: "", thinking: "high" });
+  assert.equal(missingModel.status, "blocked");
+  if (missingModel.status === "blocked") assert.equal(missingModel.reason, "BLOCKED_MISSING_MODEL");
+  const missingThinking = evaluateE03TrialReadiness({ providerTrial: "1", model: "anthropic/claude-sonnet-4", thinking: "" });
+  assert.equal(missingThinking.status, "blocked");
+  if (missingThinking.status === "blocked") assert.equal(missingThinking.reason, "BLOCKED_MISSING_THINKING");
+});
+
+test("E03 continuation provider budget charges one inference start per assistant message_end with usage", () => {
+  const budget = new E03ProviderBudget(9, Date.now(), 900_000, 300_000, 10);
+  const records: RpcRecord[] = [];
+  for (let index = 0; index < 4; index += 1) {
+    records.push({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: `assistant segment ${index}` }],
+        usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15 },
+      },
+    });
+  }
+  assert.equal(assistantMessageEndsWithUsage(records), 4);
+  chargeInferenceStartsFromRpcRecords(budget, "native", records);
+  for (let index = 0; index < 5; index += 1) budget.recordInferenceStart("native");
+  assert.throws(() => budget.recordInferenceStart("native"), /provider inference start budget/);
+});
+
+test("E03 continuation provider budget and arm deadlines enforce trial caps", () => {
+  const budget = new E03ProviderBudget(9, Date.now(), 900_000, 300_000, 4);
+  for (let index = 0; index < 4; index += 1) budget.recordInferenceStart("native");
+  for (let index = 0; index < 4; index += 1) budget.recordInferenceStart("memory");
+  budget.recordInferenceStart("seed-compaction");
+  assert.throws(() => budget.recordInferenceStart("native"), /provider inference start budget/);
+  const tightTrial = new E03ProviderBudget(9, Date.now() - 901_000, 900_000, 300_000, 4);
+  assert.throws(() => tightTrial.recordInferenceStart("native"), /whole-trial deadline/);
+  const armBudget = new E03ProviderBudget();
+  assert.throws(() => armBudget.assertArmWallDeadline("native", Date.now() - 301_000), /arm deadline/);
+});
+
+test("E03 continuation arms isolate generated responses and resident state", () => {
+  const isolation = new E03ArmIsolationRegistry();
+  isolation.registerResponse("native", "/tmp/e03/native/session.jsonl");
+  isolation.registerResponse("memory", "/tmp/e03/memory/session.jsonl");
+  isolation.setResidentState("native", "shared-resident-key");
+  isolation.setResidentState("memory", "memory-only-resident");
+  assert.throws(() => isolation.registerResponse("memory", "/tmp/e03/native/session.jsonl"), /must not share generated responses/);
+  assert.throws(() => isolation.setResidentState("memory", "shared-resident-key"), /must not share resident state/);
+});
+
+test("E03 transparent worker recorder logs bounded fields without raw state text", async (t) => {
+  const tempDir = await mkdtemp(resolve(tmpdir(), "pi-session-memory-e03-recorder-"));
+  t.after(async () => rm(tempDir, { recursive: true, force: true }));
+  const scriptPath = resolve(tempDir, "worker-recorder.py");
+  const logPath = resolve(tempDir, "worker-recorder.jsonl");
+  await writeTransparentWorkerRecorderScript(scriptPath, logPath, pinnedPythonDefault);
+  const sample = {
+    gate: "projection",
+    request_id: "req-1",
+    candidate_ids: ["obs-1"],
+    selected_entry_id: "obs-1",
+    accepted: true,
+    state_bytes: 128,
+    elapsed_ms: 12.5,
+  };
+  assertBoundedRecorderLogEntry(sample);
+  assert.throws(() => assertBoundedRecorderLogEntry({ ...sample, state: "secret raw state" }), /must not include field state/);
+});
+
+test("E03 paired coding continuation trial", {
+  timeout: E03_TRIAL_DEADLINE_MS,
+  skip: (() => {
+    const gate = evaluateE03TrialReadiness({
+      providerTrial: process.env.PI_SESSION_MEMORY_E03_PROVIDER_TRIAL,
+      model: process.env.PI_SESSION_MEMORY_E01_MODEL,
+      thinking: process.env.PI_SESSION_MEMORY_E01_THINKING,
+    });
+    if (gate.status === "ready") return false;
+    return `${gate.reason}; skipped means zero provider calls for this real pair`;
+  })(),
+}, async (t) => {
+  tDiagnosticOraclePrelabel();
+  assert.equal(process.env.PI_SESSION_MEMORY_E03_PROVIDER_TRIAL, "1");
+  assert.ok(process.env.PI_SESSION_MEMORY_E01_MODEL?.trim());
+  assert.ok(process.env.PI_SESSION_MEMORY_E01_THINKING?.trim());
+  t.diagnostic(`E03 prelabeled oracle: ${JSON.stringify(E03_PRELABELED_ORACLE)}`);
+
+  const tempRoot = await mkdtemp(resolve(tmpdir(), "pi-session-memory-e03-trial-"));
+  t.after(async () => rm(tempRoot, { recursive: true, force: true }));
+
+  const cwd = resolve(tempRoot, "project");
+  const sessionDir = resolve(tempRoot, "sessions");
+  const nativeArmDir = resolve(tempRoot, "arms/native");
+  const memoryArmDir = resolve(tempRoot, "arms/memory");
+  const inferenceEvidenceFile = resolve(tempRoot, "inference-evidence.jsonl");
+  const recorderLogPath = resolve(tempRoot, "worker-recorder.jsonl");
+  const recorderScriptPath = resolve(tempRoot, "worker-recorder.py");
+  const observerExtension = resolve(tempRoot, "e03-observer.mjs");
+  await mkdir(resolve(cwd, ".pi"), { recursive: true });
+  await mkdir(sessionDir, { recursive: true });
+  await writeFile(resolve(cwd, ".pi/settings.json"), JSON.stringify({ compaction: { keepRecentTokens: 0, reserveTokens: 16_384 } }));
+
+  const piExecutable = execFileSync("which", ["pi"], { encoding: "utf8" }).trim();
+  const resolvedPiExecutable = await realpath(piExecutable);
+  const piRoot = resolve(dirname(resolvedPiExecutable), "../..");
+  const metadata = JSON.parse(await readFile(resolve(piRoot, "package.json"), "utf8")) as { version?: unknown };
+  assert.equal(metadata.version, "1.0.2");
+  const { SessionManager } = await import(pathToFileURL(resolve(piRoot, "dist/core/session-manager.js")).href);
+
+  const seed = await seedE03ContinuationSession(SessionManager, cwd, sessionDir);
+  const canonicalSessionFile = await realpath(seed.getSessionFile());
+  const sessionFileName = canonicalSessionFile.split(sep).at(-1);
+  assert.equal(typeof sessionFileName, "string");
+
+  const probeObserver = resolve(tempRoot, "probe-observer.mjs");
+  await writeFile(probeObserver, e03TrialObserverSource(inferenceEvidenceFile));
+  let rpc = new PiRpc(piExecutable, cwd, sessionDir, canonicalSessionFile, probeObserver, {
+    includeMemoryExtension: false,
+    tools: "read,grep",
+    excludeTools: "bash,write,edit",
+    systemPrompt: "Synthetic E03 continuation trial. Read-only tools only.",
+  });
+  const probeState = await rpc.command({ type: "get_state" });
+  assert.equal(probeState.success, true);
+  assert.ok(isRecord(probeState.data?.model));
+  const testModel = smallContextModel(probeState.data.model);
+  await rpc.stop();
+
+  await writeFile(observerExtension, e03TrialObserverSource(inferenceEvidenceFile, testModel));
+  const budget = new E03ProviderBudget();
+  const isolation = new E03ArmIsolationRegistry();
+  rpc = new PiRpc(piExecutable, cwd, sessionDir, canonicalSessionFile, observerExtension, {
+    includeMemoryExtension: false,
+    tools: "read,grep",
+    excludeTools: "bash,write,edit",
+    systemPrompt: "Synthetic E03 continuation trial. Read-only tools only.",
+  });
+  const seedCompaction = await runAutomaticCompaction(rpc);
+  await rpc.stop();
+  assert.equal(seedCompaction.automaticThresholdTriggered, true);
+  budget.recordInferenceStart("seed-compaction");
+
+  const compactedEntries = await readSession(canonicalSessionFile);
+  const nativeSessionFile = await copySessionSeedForArm(canonicalSessionFile, nativeArmDir, sessionFileName!);
+  const memorySessionFile = await copySessionSeedForArm(canonicalSessionFile, memoryArmDir, sessionFileName!);
+  assertE03CompactedSeedEquality(await readSession(nativeSessionFile), await readSession(memorySessionFile));
+  assertE03CompactedSeedEquality(compactedEntries, await readSession(nativeSessionFile));
+
+  const pinnedPython = process.env.PI_SESSION_MEMORY_PYTHON ?? pinnedPythonDefault;
+  await writeTransparentWorkerRecorderScript(recorderScriptPath, recorderLogPath, pinnedPython);
+
+  const sharedLaunchBase = {
+    excludeTools: "bash,write,edit",
+    systemPrompt: "Synthetic E03 continuation trial. Read-only tools only.",
+  };
+  const layaEnv = {
+    HF_HOME: "/Users/sovorn/.cache/pi-session-memory/bp-init-laya-010bacef/hf",
+    HF_HUB_OFFLINE: "1",
+    TRANSFORMERS_OFFLINE: "1",
+    USE_TF: "0",
+    TOKENIZERS_PARALLELISM: "false",
+    PYTHONDONTWRITEBYTECODE: "1",
+    PI_RECORDER_LOG: recorderLogPath,
+  };
+  const nativeResult = await runE03ContinuationArm({
+    arm: "native",
+    piExecutable,
+    cwd,
+    sessionDir: nativeArmDir,
+    sessionFile: nativeSessionFile,
+    observerExtension,
+    launch: { ...sharedLaunchBase, includeMemoryExtension: false, tools: "read,grep" },
+    budget,
+    isolation,
+  });
+  const nativeOracle = scoreE03ContinuationOracle(nativeResult.answerText);
+
+  await writeFile(observerExtension, e03TrialObserverSource(inferenceEvidenceFile, testModel));
+  const memoryResult = await runE03ContinuationArm({
+    arm: "memory",
+    piExecutable,
+    cwd,
+    sessionDir: memoryArmDir,
+    sessionFile: memorySessionFile,
+    observerExtension,
+    launch: {
+      ...sharedLaunchBase,
+      includeMemoryExtension: true,
+      tools: "read,grep,hydrate_session_memory",
+      workerPython: recorderScriptPath,
+      env: layaEnv,
+    },
+    budget,
+    isolation,
+  });
+  const memoryOracle = scoreE03ContinuationOracle(memoryResult.answerText);
+
+  let recorderEvents: unknown[] = [];
+  try {
+    recorderEvents = (await readFile(recorderLogPath, "utf8")).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  } catch {
+    recorderEvents = [];
+  }
+  for (const entry of recorderEvents) assertBoundedRecorderLogEntry(entry);
+  assert.ok(recorderEvents.length > 0, "memory arm must capture real Laya worker decisions via the transparent recorder");
+
+  const providerCalls = budget.inferenceStartCount();
+  assert.ok(providerCalls >= 3 && providerCalls <= 9, `providerCalls must be within trial budget, got ${providerCalls}`);
+  const outcome = resolveE03ContinuationOutcome(nativeOracle.overallCorrect, memoryOracle.overallCorrect);
+  const continuationTrialArtifact = {
+    status: "completed",
+    evidenceKind: "real-coding-model-and-real-laya",
+    arms: [
+      {
+        name: "native",
+        completed: true,
+        correct: nativeOracle.overallCorrect,
+        wallMs: nativeResult.wallMs,
+        providerCalls: nativeResult.inferenceStarts,
+      },
+      {
+        name: "memory",
+        completed: true,
+        correct: memoryOracle.overallCorrect,
+        wallMs: memoryResult.wallMs,
+        providerCalls: memoryResult.inferenceStarts,
+      },
+    ],
+    providerCalls,
+    layaDecisions: recorderEvents,
+    outcome,
+    unresolvedSafetyDefects: 0,
+  };
+  await mkdir(resolve(projectRoot, "specs/verifications/e03-build"), { recursive: true });
+  await writeFile(
+    resolve(projectRoot, "specs/verifications/e03-build/continuation-trial.json"),
+    `${JSON.stringify(continuationTrialArtifact, null, 2)}\n`,
+  );
+
+  t.diagnostic(JSON.stringify({
+    prelabeledOracle: E03_PRELABELED_ORACLE,
+    taskPrompt: E03_CONTINUATION_TASK_PROMPT,
+    seedCompaction,
+    native: { ...nativeResult, oracle: nativeOracle },
+    memory: { ...memoryResult, oracle: memoryOracle },
+    layaDecisionCount: recorderEvents.length,
+  }));
+});
+
+function tDiagnosticOraclePrelabel(): void {
+  assert.match(E03_PRELABELED_ORACLE.expectedFix, /session manager/);
+  assert.match(E03_PRELABELED_ORACLE.rejectedApproach, /global|external/i);
+}
+
 function fakeCompactionRpc(response: RpcRecord, event: RpcRecord): { rpc: Pick<PiRpc, "cursor" | "command" | "waitForEvent">; commands: RpcRecord[] } {
   const commands: RpcRecord[] = [];
   return {
@@ -636,7 +1364,12 @@ function hydrationProjection(event: RpcRecord): RpcRecord {
 
 function messageEntryText(entry: unknown): string | undefined {
   if (!isRecord(entry) || !isRecord(entry.message)) return undefined;
-  const content = entry.message.content;
+  return rpcAssistantMessageText(entry.message);
+}
+
+function rpcAssistantMessageText(message: unknown): string | undefined {
+  if (!isRecord(message)) return undefined;
+  const content = message.content;
   if (!Array.isArray(content)) return typeof content === "string" ? content : undefined;
   return content.flatMap((part: unknown) => isRecord(part) && part.type === "text" && typeof part.text === "string" ? [part.text] : []).join("\n");
 }
