@@ -26,8 +26,8 @@ function scrubbed(home: string, extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEn
 
 test("the install block loads and removes the package without a provider call", { timeout: 60_000 }, async () => {
   assertOptInsUnset();
-  const readme = await readRepo("README.md");
-  const block = markedBlock(readme, "verify-install");
+  const development = await readRepo("docs/DEVELOPMENT.md");
+  const block = markedBlock(development, "verify-install");
   assert.match(block, /pi --version/);
   assert.match(block, /node --version/);
   assert.doesNotMatch(block, /\bprompt\b/);
@@ -43,8 +43,8 @@ test("the install block loads and removes the package without a provider call", 
 const laya = layaTestEnv();
 test("the Laya block runs the worker suite and projection", { timeout: 180_000, skip: laya.ready ? false : laya.reason }, async () => {
   assertOptInsUnset();
-  const readme = await readRepo("README.md");
-  const block = markedBlock(readme, "verify-laya");
+  const development = await readRepo("docs/DEVELOPMENT.md");
+  const block = markedBlock(development, "verify-laya");
   const home = await mkdtemp(resolve(tmpdir(), "pi-session-memory-readme-laya-"));
   try {
     const result = spawnSync("bash", ["-c", block], {

@@ -70,7 +70,7 @@ test("a local pi package installs, lists memory, and removes without touching th
       scripts?: unknown;
       peerDependencies?: Record<string, string>;
     };
-    assert.equal(manifest.name, "pi-session-memory");
+    assert.equal(manifest.name, "@sovorn/pi-session-memory");
     assert.ok(manifest.keywords?.includes("pi-package"));
     assert.equal(manifest.pi?.extensions?.length, 1);
     await readFile(resolve(projectRoot, manifest.pi?.extensions?.[0] ?? ""));

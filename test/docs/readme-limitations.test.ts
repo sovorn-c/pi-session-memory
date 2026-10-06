@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { readRepo } from "../support/readme.ts";
+import { readPublicDocs } from "../support/readme.ts";
 
 const REQUIRED = [
   "no demonstrated benefit",
@@ -29,9 +29,9 @@ const REQUIRED = [
   "can take seconds",
   "No build, lint, typecheck, or CI",
   "not run by this project",
-  "Not published",
-  "security review has not been run",
-  "Publication is pending",
+  "local source security review found no blocking findings",
+  "not a guarantee of security",
+  "No license has been selected",
 ];
 
 const FORBIDDEN = ["improves", "faster", "cheaper", "reduces", "proven", "production-ready", "secure", "safe to publish"];
@@ -65,11 +65,11 @@ function checkLimitations(markdown: string): void {
   if (hits.length > 0) throw new Error(`unmeasured claim: ${hits.join(", ")}`);
 }
 
-test("README reports the recorded trial, the limitations, and the unpublished status", async () => {
-  const readme = await readRepo("README.md");
+test("public docs report the recorded trial, the limitations, and the review scope", async () => {
+  const readme = await readPublicDocs();
   checkLimitations(readme);
   assert.throws(() => checkLimitations(`${readme}\nMemory improves answers.\n`), /unmeasured claim/);
-  assert.throws(() => checkLimitations(readme.replace("no demonstrated benefit", "an open question")), /missing no demonstrated benefit/);
+  assert.throws(() => checkLimitations(readme.replaceAll("no demonstrated benefit", "an open question")), /missing no demonstrated benefit/);
   assert.deepEqual(forbiddenHits("## Known limitations\n- `improves` is a rejected claim word.\n"), []);
   assert.deepEqual(forbiddenHits("Memory does not improves answers.\n"), []);
   assert.ok(forbiddenHits("## Known limitations\n- Memory improves answers.\n").includes("improves"));

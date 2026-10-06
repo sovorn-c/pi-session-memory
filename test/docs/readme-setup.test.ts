@@ -6,7 +6,7 @@ import { resolve } from "node:path";
 import { test } from "node:test";
 import { DEFAULT_GENERATION, DEFAULT_OBSERVE_AFTER_TOKENS, DEFAULT_PYTHON, DEFAULT_REFLECT_AFTER_TOKENS } from "../../src/config.ts";
 import { CANDIDATES, PROJECTION_CHARS } from "../../src/projection.ts";
-import { fencedBlocks, lineCount, productText, projectRoot, readRepo, relativeLinks, sections } from "../support/readme.ts";
+import { fencedBlocks, lineCount, productText, projectRoot, readPublicDocs, readRepo, relativeLinks, sections } from "../support/readme.ts";
 
 const EXPECTED = {
   pi: "1.0.2",
@@ -75,8 +75,31 @@ function checkSetup(markdown: string, productEnv: Set<string>, runtimeSource: st
   if (lineCount(markdown) > 300) throw new Error("README is too long");
 }
 
-test("README setup matches the package, config defaults, and pinned constants", async () => {
+test("README documents the public package sources and exact gallery links", async () => {
   const readme = await readRepo("README.md");
+  const manifest = JSON.parse(await readRepo("package.json"));
+  assert.equal(manifest.name, "@sovorn/pi-session-memory");
+  assert.notEqual(manifest.private, true, "package is prepared for authorized publication");
+  assert.equal(manifest.repository.url, "git+https://github.com/sovorn-c/pi-session-memory.git");
+  assert.deepEqual(manifest.files, ["src/", "worker/*.py", "docs/*.md"]);
+  assert.equal(manifest.publishConfig.access, "public");
+  assert.ok(readme.includes(`pi install npm:${manifest.name}`));
+  assert.ok(readme.includes("pi install git:github.com/sovorn-c/pi-session-memory"));
+  assert.ok(readme.includes("pi remove git:github.com/sovorn-c/pi-session-memory"));
+  assert.ok(readme.includes("https://pi.dev/packages/@sovorn/pi-session-memory"));
+  assert.ok(readme.includes("https://www.npmjs.com/package/@sovorn/pi-session-memory"));
+  assert.ok(readme.includes("![Pi package]"));
+  assert.ok(readme.includes("![npm]"));
+  assert.ok(readme.includes("![GitHub]"));
+  assert.ok(readme.includes("[Laya setup guide](docs/SETUP.md)"));
+  assert.ok(readme.includes("[developer notes](docs/DEVELOPMENT.md)"));
+  assert.ok(readme.includes("/memory status"));
+  assert.doesNotMatch(readme, /[0-9a-f]{40,}|verify-install|verify-laya|modelRegistry\.complete|node --test/);
+  assert.ok(lineCount(readme) <= 130, "keep the README focused on users");
+});
+
+test("public docs match the package, config defaults, and pinned constants", async () => {
+  const readme = await readPublicDocs();
   const runtime = await readRepo("worker/laya_runtime.py");
   const productEnv = new Set((await productText()).match(/PI_SESSION_MEMORY_[A-Z0-9_]+/g) ?? []);
   checkSetup(readme, productEnv, runtime);

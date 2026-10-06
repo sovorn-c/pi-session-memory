@@ -15,6 +15,14 @@ export async function readRepo(relativePath: string): Promise<string> {
   return readFile(resolve(projectRoot, relativePath), "utf8");
 }
 
+export async function readPublicDocs(): Promise<string> {
+  return (await Promise.all([
+    readRepo("README.md"),
+    readRepo("docs/SETUP.md"),
+    readRepo("docs/DEVELOPMENT.md"),
+  ])).join("\n");
+}
+
 export async function productText(): Promise<string> {
   const parts: string[] = [];
   const walk = async (dir: string): Promise<void> => {

@@ -1,10 +1,17 @@
 {
-  "name": "pi-session-memory",
-  "version": "0.1.0",
-  "private": true,
+  "name": "@sovorn/pi-session-memory",
+  "version": "0.1.1",
   "type": "module",
   "description": "Pi extension that keeps small, source-linked memories of a coding session.",
-  "keywords": ["pi-package"],
+  "homepage": "https://github.com/sovorn-c/pi-session-memory#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sovorn-c/pi-session-memory.git"
+  },
+  "bugs": { "url": "https://github.com/sovorn-c/pi-session-memory/issues" },
+  "files": ["src/", "worker/*.py", "docs/*.md"],
+  "publishConfig": { "access": "public" },
+  "keywords": ["pi-package", "pi-extension", "session-memory"],
   "pi": { "extensions": ["./src/extension.ts"] },
   "peerDependencies": { "@earendil-works/pi-coding-agent": "*" }
 }
